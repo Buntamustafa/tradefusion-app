@@ -17,10 +17,10 @@ PAIRS = {
 }
 
 # ===============================
-# FETCH MARKET DATA (BINANCE)
+# FETCH MARKET DATA (BINANCE US)
 # ===============================
 def get_data(symbol):
-    url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval=5m&limit=100"
+    url = f"https://api.binance.us/api/v3/klines?symbol={symbol}&interval=5m&limit=100"
 
     headers = {
         "User-Agent": "Mozilla/5.0"
@@ -76,7 +76,7 @@ def analyze(df):
     elif last["high"] > prev["high"]:
         liquidity = "Buy-side liquidity taken"
 
-    # FVG logic (simple)
+    # FVG logic
     fvg = "FVG present" if abs(last["high"] - last["low"]) > 0.002 else "No FVG"
 
     # Confidence score
