@@ -13,8 +13,7 @@ CORS(app)
 # ===============================
 PAIRS = {
     "EUR/USD": "EURUSDT",
-    "BTC/USD": "BTCUSDT",
-    "XAU/USD": "XAUUSDT"
+    "BTC/USD": "BTCUSDT"
 }
 
 # ===============================
@@ -22,18 +21,33 @@ PAIRS = {
 # ===============================
 def get_data(symbol):
     url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval=5m&limit=100"
-    data = requests.get(url).json()
 
-    df = pd.DataFrame(data, columns=[
-        "time","open","high","low","close","volume",
-        "close_time","qav","trades","taker_base","taker_quote","ignore"
-    ])
+    headers = {
+        "User-Agent": "Mozilla/5.0"
+    }
 
-    df["close"] = df["close"].astype(float)
-    df["high"] = df["high"].astype(float)
-    df["low"] = df["low"].astype(float)
+    try:
+        response = requests.get(url, headers=headers, timeout=10)
 
-    return df
+        if response.status_code != 200:
+            raise Exception(f"API error: {response.status_code}")
+
+        data = response.json()
+
+        df = pd.DataFrame(data, columns=[
+            "time","open","high","low","close","volume",
+            "close_time","qav","trades","taker_base","taker_quote","ignore"
+        ])
+
+        df["close"] = df["close"].astype(float)
+        df["high"] = df["high"].astype(float)
+        df["low"] = df["low"].astype(float)
+
+        return df
+
+    except Exception as e:
+        print("ERROR fetching data:", e)
+        raise
 
 # ===============================
 # ANALYSIS
@@ -47,6 +61,7 @@ def analyze(df):
 
     trend = "BUY" if last["close"] > last["ema"] else "SELL"
 
+    # RSI logic
     if last["rsi"] < 30:
         signal = "BUY"
     elif last["rsi"] > 70:
@@ -54,14 +69,17 @@ def analyze(df):
     else:
         signal = trend
 
+    # Liquidity logic
     liquidity = ""
     if last["low"] < prev["low"]:
         liquidity = "Sell-side liquidity taken"
     elif last["high"] > prev["high"]:
         liquidity = "Buy-side liquidity taken"
 
+    # FVG logic (simple)
     fvg = "FVG present" if abs(last["high"] - last["low"]) > 0.002 else "No FVG"
 
+    # Confidence score
     confidence = 70
     if signal == trend:
         confidence += 10
@@ -80,8 +98,12 @@ def analyze(df):
     }
 
 # ===============================
-# ROUTE
+# ROUTES
 # ===============================
+@app.route('/')
+def home():
+    return "NEYLA.fx API is running 🚀"
+
 @app.route('/signals')
 def signals():
     results = []
@@ -92,20 +114,13 @@ def signals():
             signal = analyze(df)
             signal["pair"] = name
             results.append(signal)
-        except:
+        except Exception as e:
             results.append({
                 "pair": name,
-                "error": "Data fetch failed"
+                "error": str(e)
             })
 
     return jsonify(results)
-
-# ===============================
-# HOME ROUTE (fix Not Found)
-# ===============================
-@app.route('/')
-def home():
-    return "NEYLA.fx API is running 🚀"
 
 # ===============================
 # RUN
