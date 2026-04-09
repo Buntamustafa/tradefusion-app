@@ -9,10 +9,9 @@ app = Flask(__name__)
 CORS(app)
 
 # ===============================
-# CONFIG
+# CONFIG (CRYPTO ONLY)
 # ===============================
 PAIRS = {
-    "EUR/USD": "EURUSDT",
     "BTC/USD": "BTCUSDT"
 }
 
@@ -90,9 +89,9 @@ def analyze(df):
 
     return {
         "action": signal,
-        "entry": round(last["close"], 4),
-        "sl": round(last["close"] * 0.99, 4),
-        "tp": round(last["close"] * 1.02, 4),
+        "entry": round(last["close"], 2),
+        "sl": round(last["close"] * 0.99, 2),
+        "tp": round(last["close"] * 1.02, 2),
         "confidence": f"{confidence}%",
         "reason": f"{trend} + RSI + {liquidity} + {fvg}"
     }
