@@ -21,28 +21,20 @@ PAIRS = {
 }
 
 # ===============================
-# TIME FILTER (KILL ZONES)
+# KILL ZONE (SESSION FILTER)
 # ===============================
 def in_kill_zone():
     now = datetime.utcnow().hour
-
-    # London Session: 7 - 10 UTC
-    # New York Session: 12 - 15 UTC
-    if 7 <= now <= 10 or 12 <= now <= 15:
-        return True
-    return False
+    return (7 <= now <= 10) or (12 <= now <= 15)
 
 # ===============================
-# NEWS FILTER (BASIC)
+# NEWS FILTER
 # ===============================
 def high_impact_news():
     try:
-        url = "https://api.twelvedata.com/economic_calendar?importance=high&apikey=" + API_KEY
+        url = f"https://api.twelvedata.com/economic_calendar?importance=high&apikey={API_KEY}"
         res = requests.get(url, timeout=5).json()
-
-        if "data" in res:
-            return True  # if any high-impact event exists
-        return False
+        return "data" in res and len(res["data"]) > 0
     except:
         return False
 
@@ -116,11 +108,36 @@ def analyze(df):
 # SIGNAL ENGINE
 # ===============================
 def generate_signal(df_5m, df_15m):
-    # ⛔ Session Filter
-    if not in_kill_zone():
-        return {"message": "Outside kill zone"}
 
-    # ⛔ News Filter
+    # ===============================
+    # ⚡ SCALP OUTSIDE KILL ZONE
+    # ===============================
+    if not in_kill_zone():
+        a5 = analyze(df_5m)
+        entry = a5["close"]
+        trend = a5["trend"]
+        rsi = a5["rsi"]
+
+        if trend == "BUY":
+            sl = entry * 0.997
+            tp = entry * 1.01
+        else:
+            sl = entry * 1.003
+            tp = entry * 0.99
+
+        return {
+            "action": trend,
+            "entry": round(entry, 4),
+            "sl": round(sl, 4),
+            "tp": round(tp, 4),
+            "confidence": "55%",
+            "strength": "SCALP ⚡ (OUTSIDE SESSION)",
+            "reason": f"Outside kill zone | Trend={trend} | RSI={round(rsi,1)}"
+        }
+
+    # ===============================
+    # ⛔ NEWS FILTER
+    # ===============================
     if high_impact_news():
         return {"message": "High impact news - stay out"}
 
@@ -139,7 +156,9 @@ def generate_signal(df_5m, df_15m):
     signal = None
     strength = None
 
+    # ===============================
     # 💀 SNIPER
+    # ===============================
     if (
         trend_5m == "BUY"
         and trend_15m == "BUY"
@@ -162,7 +181,9 @@ def generate_signal(df_5m, df_15m):
         signal = "SELL"
         strength = "SNIPER 💀"
 
+    # ===============================
     # 💪 STRONG
+    # ===============================
     elif (
         trend_5m == trend_15m
         and (
@@ -173,12 +194,16 @@ def generate_signal(df_5m, df_15m):
         signal = trend_5m
         strength = "STRONG"
 
-    # ⚡ SCALP
+    # ===============================
+    # ⚡ SCALP (INSIDE SESSION)
+    # ===============================
     else:
         signal = trend_5m
         strength = "SCALP ⚡"
 
-    # Risk
+    # ===============================
+    # RISK MANAGEMENT
+    # ===============================
     if signal == "BUY":
         sl = entry * 0.997
         tp = entry * 1.02
@@ -186,7 +211,9 @@ def generate_signal(df_5m, df_15m):
         sl = entry * 1.003
         tp = entry * 0.98
 
-    # Confidence
+    # ===============================
+    # CONFIDENCE
+    # ===============================
     confidence = 60
     if strength == "STRONG":
         confidence = 80
@@ -208,7 +235,7 @@ def generate_signal(df_5m, df_15m):
 # ===============================
 @app.route('/')
 def home():
-    return "NEYLA.fx ELITE API is running 🚀"
+    return "NEYLA.fx ELITE PRO MAX API is running 🚀"
 
 @app.route('/signals')
 def signals():
