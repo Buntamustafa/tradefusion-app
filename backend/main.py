@@ -21,7 +21,7 @@ PAIRS = {
 }
 
 # ===============================
-# KILL ZONE (SESSION FILTER)
+# KILL ZONE
 # ===============================
 def in_kill_zone():
     now = datetime.utcnow().hour
@@ -43,21 +43,40 @@ def high_impact_news():
 # ===============================
 def get_data(symbol, interval):
     url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval={interval}&outputsize=100&apikey={API_KEY}"
+    res = requests.get(url, timeout=10).json()
 
-    response = requests.get(url, timeout=10)
-    data = response.json()
+    if "values" not in res:
+        raise Exception(res.get("message", "Data fetch failed"))
 
-    if "values" not in data:
-        raise Exception(data.get("message", "Data fetch failed"))
-
-    df = pd.DataFrame(data["values"])
+    df = pd.DataFrame(res["values"])
     df = df.iloc[::-1]
 
+    df["open"] = df["open"].astype(float)
     df["close"] = df["close"].astype(float)
     df["high"] = df["high"].astype(float)
     df["low"] = df["low"].astype(float)
 
     return df
+
+# ===============================
+# ENTRY CONFIRMATION (WICKS)
+# ===============================
+def confirmation(df):
+    last = df.iloc[-1]
+
+    body = abs(last["close"] - last["open"])
+    upper_wick = last["high"] - max(last["open"], last["close"])
+    lower_wick = min(last["open"], last["close"]) - last["low"]
+
+    # Bullish rejection
+    if lower_wick > body * 1.5:
+        return "BUY"
+
+    # Bearish rejection
+    if upper_wick > body * 1.5:
+        return "SELL"
+
+    return None
 
 # ===============================
 # ANALYSIS
@@ -74,21 +93,18 @@ def analyze(df):
     trend = "BUY" if last["ema20"] > last["ema50"] else "SELL"
     rsi = last["rsi"]
 
-    # Liquidity
     liquidity = None
     if last["low"] < prev["low"]:
         liquidity = "SELL_SIDE"
     elif last["high"] > prev["high"]:
         liquidity = "BUY_SIDE"
 
-    # FVG
     fvg = None
     if prev["low"] > prev2["high"]:
         fvg = "BULLISH"
     elif prev["high"] < prev2["low"]:
         fvg = "BEARISH"
 
-    # BOS
     bos = None
     if last["high"] > prev["high"] and prev["high"] > prev2["high"]:
         bos = "BULLISH"
@@ -109,16 +125,31 @@ def analyze(df):
 # ===============================
 def generate_signal(df_5m, df_15m):
 
+    a5 = analyze(df_5m)
+    a15 = analyze(df_15m)
+    confirm = confirmation(df_5m)
+
+    trend_5m = a5["trend"]
+    trend_15m = a15["trend"]
+    rsi = a5["rsi"]
+    liquidity = a5["liquidity"]
+    fvg = a5["fvg"]
+    bos = a5["bos"]
+    entry = a5["close"]
+
     # ===============================
-    # ⚡ SCALP OUTSIDE KILL ZONE
+    # ⚡ SCALP OUTSIDE SESSION (FILTERED)
     # ===============================
     if not in_kill_zone():
-        a5 = analyze(df_5m)
-        entry = a5["close"]
-        trend = a5["trend"]
-        rsi = a5["rsi"]
 
-        if trend == "BUY":
+        if trend_5m == "BUY" and rsi < 60 and confirm == "BUY":
+            signal = "BUY"
+        elif trend_5m == "SELL" and rsi > 40 and confirm == "SELL":
+            signal = "SELL"
+        else:
+            return {"message": "No clean scalp"}
+
+        if signal == "BUY":
             sl = entry * 0.997
             tp = entry * 1.01
         else:
@@ -126,38 +157,26 @@ def generate_signal(df_5m, df_15m):
             tp = entry * 0.99
 
         return {
-            "action": trend,
+            "action": signal,
             "entry": round(entry, 4),
             "sl": round(sl, 4),
             "tp": round(tp, 4),
-            "confidence": "55%",
-            "strength": "SCALP ⚡ (OUTSIDE SESSION)",
-            "reason": f"Outside kill zone | Trend={trend} | RSI={round(rsi,1)}"
+            "confidence": "60%",
+            "strength": "SCALP ⚡ (CONFIRMED)",
+            "reason": f"Outside kill zone | Confirmed {signal} | RSI={round(rsi,1)}"
         }
 
     # ===============================
-    # ⛔ NEWS FILTER
+    # NEWS FILTER
     # ===============================
     if high_impact_news():
         return {"message": "High impact news - stay out"}
-
-    a5 = analyze(df_5m)
-    a15 = analyze(df_15m)
-
-    trend_5m = a5["trend"]
-    trend_15m = a15["trend"]
-
-    rsi = a5["rsi"]
-    liquidity = a5["liquidity"]
-    fvg = a5["fvg"]
-    bos = a5["bos"]
-    entry = a5["close"]
 
     signal = None
     strength = None
 
     # ===============================
-    # 💀 SNIPER
+    # 💀 SNIPER (WITH CONFIRMATION)
     # ===============================
     if (
         trend_5m == "BUY"
@@ -166,6 +185,7 @@ def generate_signal(df_5m, df_15m):
         and fvg == "BULLISH"
         and bos == "BULLISH"
         and rsi < 45
+        and confirm == "BUY"
     ):
         signal = "BUY"
         strength = "SNIPER 💀"
@@ -177,6 +197,7 @@ def generate_signal(df_5m, df_15m):
         and fvg == "BEARISH"
         and bos == "BEARISH"
         and rsi > 55
+        and confirm == "SELL"
     ):
         signal = "SELL"
         strength = "SNIPER 💀"
@@ -186,10 +207,7 @@ def generate_signal(df_5m, df_15m):
     # ===============================
     elif (
         trend_5m == trend_15m
-        and (
-            (trend_5m == "BUY" and liquidity == "SELL_SIDE" and bos == "BULLISH")
-            or (trend_5m == "SELL" and liquidity == "BUY_SIDE" and bos == "BEARISH")
-        )
+        and confirm == trend_5m
     ):
         signal = trend_5m
         strength = "STRONG"
@@ -198,11 +216,14 @@ def generate_signal(df_5m, df_15m):
     # ⚡ SCALP (INSIDE SESSION)
     # ===============================
     else:
-        signal = trend_5m
-        strength = "SCALP ⚡"
+        if confirm:
+            signal = confirm
+            strength = "SCALP ⚡"
+        else:
+            return {"message": "No valid setup"}
 
     # ===============================
-    # RISK MANAGEMENT
+    # RISK
     # ===============================
     if signal == "BUY":
         sl = entry * 0.997
@@ -211,9 +232,6 @@ def generate_signal(df_5m, df_15m):
         sl = entry * 1.003
         tp = entry * 0.98
 
-    # ===============================
-    # CONFIDENCE
-    # ===============================
     confidence = 60
     if strength == "STRONG":
         confidence = 80
@@ -227,7 +245,7 @@ def generate_signal(df_5m, df_15m):
         "tp": round(tp, 4),
         "confidence": f"{confidence}%",
         "strength": strength,
-        "reason": f"5m:{trend_5m} | 15m:{trend_15m} | BOS:{bos} | {liquidity} | {fvg} | RSI={round(rsi,1)}"
+        "reason": f"{strength} | Confirmed | 5m:{trend_5m} | 15m:{trend_15m} | RSI={round(rsi,1)}"
     }
 
 # ===============================
@@ -235,7 +253,7 @@ def generate_signal(df_5m, df_15m):
 # ===============================
 @app.route('/')
 def home():
-    return "NEYLA.fx ELITE PRO MAX API is running 🚀"
+    return "NEYLA.fx PRECISION AI is running 🚀"
 
 @app.route('/signals')
 def signals():
