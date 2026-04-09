@@ -50,7 +50,7 @@ def get_trend(df):
     return "BUY" if last["close"] > last["ema"] else "SELL"
 
 # ===============================
-# SMART SNIPER ANALYSIS
+# BALANCED SMART SNIPER ANALYSIS
 # ===============================
 def analyze(df_5m, df_15m):
     df_5m["rsi"] = ta.momentum.RSIIndicator(df_5m["close"]).rsi()
@@ -63,7 +63,7 @@ def analyze(df_5m, df_15m):
     trend_5m = "BUY" if last["close"] > last["ema"] else "SELL"
     trend_15m = get_trend(df_15m)
 
-    # MUST match trend
+    # MUST align trend
     if trend_5m != trend_15m:
         return None
 
@@ -73,41 +73,44 @@ def analyze(df_5m, df_15m):
     # CONDITIONS
     # ===============================
     liquidity = False
+    liquidity_text = None
     if last["low"] < prev["low"] and prev["low"] < prev2["low"]:
         liquidity = True
         liquidity_text = "Sell-side liquidity swept"
     elif last["high"] > prev["high"] and prev["high"] > prev2["high"]:
         liquidity = True
         liquidity_text = "Buy-side liquidity swept"
-    else:
-        liquidity_text = None
 
     fvg = False
+    fvg_text = None
     if prev2["high"] < prev["low"]:
         fvg = True
         fvg_text = "Bullish FVG"
     elif prev2["low"] > prev["high"]:
         fvg = True
         fvg_text = "Bearish FVG"
-    else:
-        fvg_text = None
 
     rsi_confirm = False
-    if (trend == "BUY" and last["rsi"] < 40) or (trend == "SELL" and last["rsi"] > 60):
+    if (trend == "BUY" and last["rsi"] < 45) or (trend == "SELL" and last["rsi"] > 55):
         rsi_confirm = True
 
     # ===============================
-    # SMART SNIPER LOGIC (2/3 RULE)
+    # SCORING SYSTEM
     # ===============================
     score = sum([liquidity, fvg, rsi_confirm])
 
-    if score < 2:
-        return None  # ❌ no trade
+    if score == 0:
+        return None
 
     # ===============================
-    # CONFIDENCE
+    # CONFIDENCE LEVELS
     # ===============================
-    confidence = 75 + (score * 5)
+    if score == 3:
+        confidence = 90
+    elif score == 2:
+        confidence = 82
+    else:
+        confidence = 70
 
     # ===============================
     # OUTPUT
@@ -126,7 +129,7 @@ def analyze(df_5m, df_15m):
 # ===============================
 @app.route('/')
 def home():
-    return "NEYLA.fx SMART SNIPER 🚀"
+    return "NEYLA.fx SMART SNIPER LIVE 🚀"
 
 @app.route('/signals')
 def signals():
