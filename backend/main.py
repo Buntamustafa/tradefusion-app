@@ -4,6 +4,7 @@ import requests
 import pandas as pd
 import ta
 import os
+from datetime import datetime
 
 app = Flask(__name__)
 CORS(app)
@@ -18,6 +19,32 @@ PAIRS = {
     "BTC/USD": "BTC/USD",
     "XAU/USD": "XAU/USD"
 }
+
+# ===============================
+# TIME FILTER (KILL ZONES)
+# ===============================
+def in_kill_zone():
+    now = datetime.utcnow().hour
+
+    # London Session: 7 - 10 UTC
+    # New York Session: 12 - 15 UTC
+    if 7 <= now <= 10 or 12 <= now <= 15:
+        return True
+    return False
+
+# ===============================
+# NEWS FILTER (BASIC)
+# ===============================
+def high_impact_news():
+    try:
+        url = "https://api.twelvedata.com/economic_calendar?importance=high&apikey=" + API_KEY
+        res = requests.get(url, timeout=5).json()
+
+        if "data" in res:
+            return True  # if any high-impact event exists
+        return False
+    except:
+        return False
 
 # ===============================
 # FETCH DATA
@@ -41,7 +68,7 @@ def get_data(symbol, interval):
     return df
 
 # ===============================
-# ANALYSIS FUNCTION
+# ANALYSIS
 # ===============================
 def analyze(df):
     df["rsi"] = ta.momentum.RSIIndicator(df["close"]).rsi()
@@ -50,34 +77,53 @@ def analyze(df):
 
     last = df.iloc[-1]
     prev = df.iloc[-2]
+    prev2 = df.iloc[-3]
 
     trend = "BUY" if last["ema20"] > last["ema50"] else "SELL"
     rsi = last["rsi"]
 
+    # Liquidity
     liquidity = None
     if last["low"] < prev["low"]:
         liquidity = "SELL_SIDE"
     elif last["high"] > prev["high"]:
         liquidity = "BUY_SIDE"
 
+    # FVG
     fvg = None
-    if last["low"] > prev["high"]:
+    if prev["low"] > prev2["high"]:
         fvg = "BULLISH"
-    elif last["high"] < prev["low"]:
+    elif prev["high"] < prev2["low"]:
         fvg = "BEARISH"
+
+    # BOS
+    bos = None
+    if last["high"] > prev["high"] and prev["high"] > prev2["high"]:
+        bos = "BULLISH"
+    elif last["low"] < prev["low"] and prev["low"] < prev2["low"]:
+        bos = "BEARISH"
 
     return {
         "trend": trend,
         "rsi": rsi,
         "liquidity": liquidity,
         "fvg": fvg,
+        "bos": bos,
         "close": last["close"]
     }
 
 # ===============================
-# MULTI-TIMEFRAME ENGINE
+# SIGNAL ENGINE
 # ===============================
 def generate_signal(df_5m, df_15m):
+    # ⛔ Session Filter
+    if not in_kill_zone():
+        return {"message": "Outside kill zone"}
+
+    # ⛔ News Filter
+    if high_impact_news():
+        return {"message": "High impact news - stay out"}
+
     a5 = analyze(df_5m)
     a15 = analyze(df_15m)
 
@@ -87,20 +133,20 @@ def generate_signal(df_5m, df_15m):
     rsi = a5["rsi"]
     liquidity = a5["liquidity"]
     fvg = a5["fvg"]
+    bos = a5["bos"]
     entry = a5["close"]
 
     signal = None
     strength = None
 
-    # ===============================
-    # SNIPER (BOTH TIMEFRAMES AGREE)
-    # ===============================
+    # 💀 SNIPER
     if (
         trend_5m == "BUY"
         and trend_15m == "BUY"
-        and rsi < 40
         and liquidity == "SELL_SIDE"
         and fvg == "BULLISH"
+        and bos == "BULLISH"
+        and rsi < 45
     ):
         signal = "BUY"
         strength = "SNIPER 💀"
@@ -108,38 +154,39 @@ def generate_signal(df_5m, df_15m):
     elif (
         trend_5m == "SELL"
         and trend_15m == "SELL"
-        and rsi > 60
         and liquidity == "BUY_SIDE"
         and fvg == "BEARISH"
+        and bos == "BEARISH"
+        and rsi > 55
     ):
         signal = "SELL"
         strength = "SNIPER 💀"
 
-    # ===============================
-    # STRONG (TREND CONFIRMED)
-    # ===============================
-    elif trend_5m == trend_15m:
+    # 💪 STRONG
+    elif (
+        trend_5m == trend_15m
+        and (
+            (trend_5m == "BUY" and liquidity == "SELL_SIDE" and bos == "BULLISH")
+            or (trend_5m == "SELL" and liquidity == "BUY_SIDE" and bos == "BEARISH")
+        )
+    ):
         signal = trend_5m
         strength = "STRONG"
 
-    # ===============================
-    # SCALP (DIFFERENT TIMEFRAMES)
-    # ===============================
+    # ⚡ SCALP
     else:
         signal = trend_5m
         strength = "SCALP ⚡"
 
-    # ===============================
-    # RISK MANAGEMENT
-    # ===============================
+    # Risk
     if signal == "BUY":
         sl = entry * 0.997
-        tp = entry * 1.015
+        tp = entry * 1.02
     else:
         sl = entry * 1.003
-        tp = entry * 0.985
+        tp = entry * 0.98
 
-    # CONFIDENCE
+    # Confidence
     confidence = 60
     if strength == "STRONG":
         confidence = 80
@@ -153,7 +200,7 @@ def generate_signal(df_5m, df_15m):
         "tp": round(tp, 4),
         "confidence": f"{confidence}%",
         "strength": strength,
-        "reason": f"5m:{trend_5m} | 15m:{trend_15m} | RSI={round(rsi,1)} | {liquidity} | {fvg}"
+        "reason": f"5m:{trend_5m} | 15m:{trend_15m} | BOS:{bos} | {liquidity} | {fvg} | RSI={round(rsi,1)}"
     }
 
 # ===============================
@@ -161,7 +208,7 @@ def generate_signal(df_5m, df_15m):
 # ===============================
 @app.route('/')
 def home():
-    return "NEYLA.fx API is running 🚀"
+    return "NEYLA.fx ELITE API is running 🚀"
 
 @app.route('/signals')
 def signals():
