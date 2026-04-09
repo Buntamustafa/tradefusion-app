@@ -8,9 +8,6 @@ import os
 app = Flask(__name__)
 CORS(app)
 
-# ===============================
-# CONFIG
-# ===============================
 PAIRS = {
     "BTC/USD": "BTCUSDT"
 }
@@ -21,9 +18,7 @@ PAIRS = {
 def get_data(symbol, interval="5m"):
     url = f"https://api.binance.us/api/v3/klines?symbol={symbol}&interval={interval}&limit=150"
 
-    headers = {"User-Agent": "Mozilla/5.0"}
-
-    response = requests.get(url, headers=headers, timeout=10)
+    response = requests.get(url, timeout=10)
 
     if response.status_code != 200:
         raise Exception(f"API error: {response.status_code}")
@@ -42,7 +37,7 @@ def get_data(symbol, interval="5m"):
     return df
 
 # ===============================
-# TREND FUNCTION (15m)
+# TREND (15m)
 # ===============================
 def get_trend(df):
     df["ema"] = ta.trend.EMAIndicator(df["close"], window=50).ema_indicator()
@@ -50,7 +45,7 @@ def get_trend(df):
     return "BUY" if last["close"] > last["ema"] else "SELL"
 
 # ===============================
-# BALANCED SMART SNIPER ANALYSIS
+# FINAL ANALYSIS
 # ===============================
 def analyze(df_5m, df_15m):
     df_5m["rsi"] = ta.momentum.RSIIndicator(df_5m["close"]).rsi()
@@ -63,17 +58,11 @@ def analyze(df_5m, df_15m):
     trend_5m = "BUY" if last["close"] > last["ema"] else "SELL"
     trend_15m = get_trend(df_15m)
 
-    # MUST align trend
-    if trend_5m != trend_15m:
-        return None
+    trend = trend_5m if trend_5m == trend_15m else trend_5m
 
-    trend = trend_5m
-
-    # ===============================
     # CONDITIONS
-    # ===============================
     liquidity = False
-    liquidity_text = None
+    liquidity_text = "None"
     if last["low"] < prev["low"] and prev["low"] < prev2["low"]:
         liquidity = True
         liquidity_text = "Sell-side liquidity swept"
@@ -82,7 +71,7 @@ def analyze(df_5m, df_15m):
         liquidity_text = "Buy-side liquidity swept"
 
     fvg = False
-    fvg_text = None
+    fvg_text = "None"
     if prev2["high"] < prev["low"]:
         fvg = True
         fvg_text = "Bullish FVG"
@@ -91,36 +80,29 @@ def analyze(df_5m, df_15m):
         fvg_text = "Bearish FVG"
 
     rsi_confirm = False
-    if (trend == "BUY" and last["rsi"] < 45) or (trend == "SELL" and last["rsi"] > 55):
+    if (trend == "BUY" and last["rsi"] < 50) or (trend == "SELL" and last["rsi"] > 50):
         rsi_confirm = True
 
-    # ===============================
-    # SCORING SYSTEM
-    # ===============================
     score = sum([liquidity, fvg, rsi_confirm])
 
-    if score == 0:
-        return None
-
-    # ===============================
-    # CONFIDENCE LEVELS
-    # ===============================
+    # CONFIDENCE TIERS
     if score == 3:
         confidence = 90
+        strength = "STRONG"
     elif score == 2:
         confidence = 82
+        strength = "MEDIUM"
     else:
         confidence = 70
+        strength = "WEAK"
 
-    # ===============================
-    # OUTPUT
-    # ===============================
     return {
         "action": trend,
         "entry": round(last["close"], 2),
         "sl": round(last["close"] * 0.995, 2),
         "tp": round(last["close"] * 1.02, 2),
         "confidence": f"{confidence}%",
+        "strength": strength,
         "reason": f"{trend} | {liquidity_text} | {fvg_text} | RSI={round(last['rsi'],1)}"
     }
 
@@ -129,7 +111,7 @@ def analyze(df_5m, df_15m):
 # ===============================
 @app.route('/')
 def home():
-    return "NEYLA.fx SMART SNIPER LIVE 🚀"
+    return "NEYLA.fx LIVE ENGINE 🚀"
 
 @app.route('/signals')
 def signals():
@@ -141,15 +123,9 @@ def signals():
             df_15m = get_data(symbol, "15m")
 
             signal = analyze(df_5m, df_15m)
+            signal["pair"] = name
 
-            if signal:
-                signal["pair"] = name
-                results.append(signal)
-            else:
-                results.append({
-                    "pair": name,
-                    "message": "No valid setup"
-                })
+            results.append(signal)
 
         except Exception as e:
             results.append({
