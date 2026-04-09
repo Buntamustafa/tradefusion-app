@@ -16,14 +16,12 @@ PAIRS = {
 }
 
 # ===============================
-# FETCH DATA (MULTI TIMEFRAME)
+# FETCH DATA
 # ===============================
 def get_data(symbol, interval="5m"):
     url = f"https://api.binance.us/api/v3/klines?symbol={symbol}&interval={interval}&limit=150"
 
-    headers = {
-        "User-Agent": "Mozilla/5.0"
-    }
+    headers = {"User-Agent": "Mozilla/5.0"}
 
     response = requests.get(url, headers=headers, timeout=10)
 
@@ -52,7 +50,7 @@ def get_trend(df):
     return "BUY" if last["close"] > last["ema"] else "SELL"
 
 # ===============================
-# SNIPER ANALYSIS
+# SMART SNIPER ANALYSIS
 # ===============================
 def analyze(df_5m, df_15m):
     df_5m["rsi"] = ta.momentum.RSIIndicator(df_5m["close"]).rsi()
@@ -65,63 +63,62 @@ def analyze(df_5m, df_15m):
     trend_5m = "BUY" if last["close"] > last["ema"] else "SELL"
     trend_15m = get_trend(df_15m)
 
-    # ===============================
-    # REQUIRE TREND ALIGNMENT
-    # ===============================
+    # MUST match trend
     if trend_5m != trend_15m:
         return None
 
     trend = trend_5m
 
     # ===============================
-    # LIQUIDITY SWEEP (MANDATORY)
+    # CONDITIONS
     # ===============================
-    liquidity = None
+    liquidity = False
     if last["low"] < prev["low"] and prev["low"] < prev2["low"]:
-        liquidity = "Sell-side liquidity swept"
+        liquidity = True
+        liquidity_text = "Sell-side liquidity swept"
     elif last["high"] > prev["high"] and prev["high"] > prev2["high"]:
-        liquidity = "Buy-side liquidity swept"
+        liquidity = True
+        liquidity_text = "Buy-side liquidity swept"
+    else:
+        liquidity_text = None
 
-    if not liquidity:
-        return None  # ❌ no trade
-
-    # ===============================
-    # FVG (MANDATORY)
-    # ===============================
-    fvg = None
+    fvg = False
     if prev2["high"] < prev["low"]:
-        fvg = "Bullish FVG"
+        fvg = True
+        fvg_text = "Bullish FVG"
     elif prev2["low"] > prev["high"]:
-        fvg = "Bearish FVG"
+        fvg = True
+        fvg_text = "Bearish FVG"
+    else:
+        fvg_text = None
 
-    if not fvg:
+    rsi_confirm = False
+    if (trend == "BUY" and last["rsi"] < 40) or (trend == "SELL" and last["rsi"] > 60):
+        rsi_confirm = True
+
+    # ===============================
+    # SMART SNIPER LOGIC (2/3 RULE)
+    # ===============================
+    score = sum([liquidity, fvg, rsi_confirm])
+
+    if score < 2:
         return None  # ❌ no trade
 
     # ===============================
-    # FINAL SIGNAL
+    # CONFIDENCE
     # ===============================
-    signal = trend
-
-    # ===============================
-    # CONFIDENCE (STRICT)
-    # ===============================
-    confidence = 85
-
-    if "liquidity" in liquidity:
-        confidence += 5
-    if "FVG" in fvg:
-        confidence += 5
+    confidence = 75 + (score * 5)
 
     # ===============================
     # OUTPUT
     # ===============================
     return {
-        "action": signal,
+        "action": trend,
         "entry": round(last["close"], 2),
         "sl": round(last["close"] * 0.995, 2),
         "tp": round(last["close"] * 1.02, 2),
         "confidence": f"{confidence}%",
-        "reason": f"{trend} | {liquidity} | {fvg} | MTF aligned"
+        "reason": f"{trend} | {liquidity_text} | {fvg_text} | RSI={round(last['rsi'],1)}"
     }
 
 # ===============================
@@ -129,7 +126,7 @@ def analyze(df_5m, df_15m):
 # ===============================
 @app.route('/')
 def home():
-    return "NEYLA.fx SNIPER API 🚀"
+    return "NEYLA.fx SMART SNIPER 🚀"
 
 @app.route('/signals')
 def signals():
@@ -148,7 +145,7 @@ def signals():
             else:
                 results.append({
                     "pair": name,
-                    "message": "No sniper setup"
+                    "message": "No valid setup"
                 })
 
         except Exception as e:
