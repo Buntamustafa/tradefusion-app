@@ -32,7 +32,7 @@ def get_data(symbol):
         raise Exception(data.get("message", "Data fetch failed"))
 
     df = pd.DataFrame(data["values"])
-    df = df.iloc[::-1]  # oldest → newest
+    df = df.iloc[::-1]
 
     df["close"] = df["close"].astype(float)
     df["high"] = df["high"].astype(float)
@@ -41,7 +41,7 @@ def get_data(symbol):
     return df
 
 # ===============================
-# ANALYSIS ENGINE (SMART FILTER)
+# ANALYSIS ENGINE (BALANCED)
 # ===============================
 def analyze(df):
     df["rsi"] = ta.momentum.RSIIndicator(df["close"]).rsi()
@@ -71,15 +71,34 @@ def analyze(df):
         fvg = "BEARISH"
 
     # ===============================
-    # STRICT SIGNAL LOGIC
+    # BALANCED SIGNAL LOGIC
     # ===============================
     signal = None
     strength = "NONE"
 
-    # BUY SETUPS
+    # NORMAL TRADES (MORE FREQUENT)
     if (
         trend == "BUY"
-        and rsi < 45
+        and rsi < 50
+        and liquidity == "SELL_SIDE"
+        and (fvg == "BULLISH" or fvg is None)
+    ):
+        signal = "BUY"
+        strength = "STRONG"
+
+    elif (
+        trend == "SELL"
+        and rsi > 50
+        and liquidity == "BUY_SIDE"
+        and (fvg == "BEARISH" or fvg is None)
+    ):
+        signal = "SELL"
+        strength = "STRONG"
+
+    # SNIPER MODE (RARE BUT POWERFUL)
+    if (
+        trend == "BUY"
+        and rsi < 40
         and liquidity == "SELL_SIDE"
         and fvg == "BULLISH"
     ):
@@ -87,30 +106,13 @@ def analyze(df):
         strength = "SNIPER 💀"
 
     elif (
-        trend == "BUY"
-        and rsi < 55
-        and liquidity == "SELL_SIDE"
-    ):
-        signal = "BUY"
-        strength = "STRONG"
-
-    # SELL SETUPS
-    elif (
         trend == "SELL"
-        and rsi > 55
+        and rsi > 60
         and liquidity == "BUY_SIDE"
         and fvg == "BEARISH"
     ):
         signal = "SELL"
         strength = "SNIPER 💀"
-
-    elif (
-        trend == "SELL"
-        and rsi > 50
-        and liquidity == "BUY_SIDE"
-    ):
-        signal = "SELL"
-        strength = "STRONG"
 
     # NO TRADE
     if signal is None:
@@ -118,7 +120,9 @@ def analyze(df):
 
     entry = last["close"]
 
+    # ===============================
     # RISK MANAGEMENT
+    # ===============================
     if signal == "BUY":
         sl = entry * 0.995
         tp = entry * 1.02
@@ -126,6 +130,7 @@ def analyze(df):
         sl = entry * 1.005
         tp = entry * 0.98
 
+    # CONFIDENCE
     confidence = 70
     if strength == "STRONG":
         confidence = 85
