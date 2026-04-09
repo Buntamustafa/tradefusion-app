@@ -8,27 +8,31 @@ import os
 app = Flask(__name__)
 CORS(app)
 
+# ===============================
+# CONFIG
+# ===============================
+API_KEY = os.getenv("TWELVE_API_KEY")
+
 PAIRS = {
-    "BTC/USD": "BTCUSDT"
+    "EUR/USD": "EUR/USD",
+    "BTC/USD": "BTC/USD",
+    "XAU/USD": "XAU/USD"
 }
 
 # ===============================
-# FETCH DATA
+# FETCH DATA (TWELVEDATA)
 # ===============================
-def get_data(symbol, interval="5m"):
-    url = f"https://api.binance.us/api/v3/klines?symbol={symbol}&interval={interval}&limit=150"
+def get_data(symbol):
+    url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval=5min&outputsize=100&apikey={API_KEY}"
 
     response = requests.get(url, timeout=10)
-
-    if response.status_code != 200:
-        raise Exception(f"API error: {response.status_code}")
-
     data = response.json()
 
-    df = pd.DataFrame(data, columns=[
-        "time","open","high","low","close","volume",
-        "close_time","qav","trades","taker_base","taker_quote","ignore"
-    ])
+    if "values" not in data:
+        raise Exception(data.get("message", "Data fetch failed"))
+
+    df = pd.DataFrame(data["values"])
+    df = df.iloc[::-1]  # reverse to oldest → newest
 
     df["close"] = df["close"].astype(float)
     df["high"] = df["high"].astype(float)
@@ -37,73 +41,111 @@ def get_data(symbol, interval="5m"):
     return df
 
 # ===============================
-# TREND (15m)
+# ANALYSIS ENGINE (ALL-IN-ONE)
 # ===============================
-def get_trend(df):
-    df["ema"] = ta.trend.EMAIndicator(df["close"], window=50).ema_indicator()
+def analyze(df):
+    df["rsi"] = ta.momentum.RSIIndicator(df["close"]).rsi()
+    df["ema20"] = ta.trend.EMAIndicator(df["close"], window=20).ema_indicator()
+    df["ema50"] = ta.trend.EMAIndicator(df["close"], window=50).ema_indicator()
+
     last = df.iloc[-1]
-    return "BUY" if last["close"] > last["ema"] else "SELL"
+    prev = df.iloc[-2]
 
-# ===============================
-# FINAL ANALYSIS
-# ===============================
-def analyze(df_5m, df_15m):
-    df_5m["rsi"] = ta.momentum.RSIIndicator(df_5m["close"]).rsi()
-    df_5m["ema"] = ta.trend.EMAIndicator(df_5m["close"], window=50).ema_indicator()
-
-    last = df_5m.iloc[-1]
-    prev = df_5m.iloc[-2]
-    prev2 = df_5m.iloc[-3]
-
-    trend_5m = "BUY" if last["close"] > last["ema"] else "SELL"
-    trend_15m = get_trend(df_15m)
-
-    trend = trend_5m if trend_5m == trend_15m else trend_5m
-
-    # CONDITIONS
-    liquidity = False
-    liquidity_text = "None"
-    if last["low"] < prev["low"] and prev["low"] < prev2["low"]:
-        liquidity = True
-        liquidity_text = "Sell-side liquidity swept"
-    elif last["high"] > prev["high"] and prev["high"] > prev2["high"]:
-        liquidity = True
-        liquidity_text = "Buy-side liquidity swept"
-
-    fvg = False
-    fvg_text = "None"
-    if prev2["high"] < prev["low"]:
-        fvg = True
-        fvg_text = "Bullish FVG"
-    elif prev2["low"] > prev["high"]:
-        fvg = True
-        fvg_text = "Bearish FVG"
-
-    rsi_confirm = False
-    if (trend == "BUY" and last["rsi"] < 50) or (trend == "SELL" and last["rsi"] > 50):
-        rsi_confirm = True
-
-    score = sum([liquidity, fvg, rsi_confirm])
-
-    # CONFIDENCE TIERS
-    if score == 3:
-        confidence = 90
-        strength = "STRONG"
-    elif score == 2:
-        confidence = 82
-        strength = "MEDIUM"
+    # ===============================
+    # TREND
+    # ===============================
+    if last["ema20"] > last["ema50"]:
+        trend = "BUY"
     else:
-        confidence = 70
-        strength = "WEAK"
+        trend = "SELL"
+
+    # ===============================
+    # RSI
+    # ===============================
+    if last["rsi"] < 30:
+        rsi_signal = "BUY"
+    elif last["rsi"] > 70:
+        rsi_signal = "SELL"
+    else:
+        rsi_signal = "NEUTRAL"
+
+    # ===============================
+    # LIQUIDITY
+    # ===============================
+    liquidity = None
+    if last["low"] < prev["low"]:
+        liquidity = "Sell-side liquidity taken"
+    elif last["high"] > prev["high"]:
+        liquidity = "Buy-side liquidity taken"
+
+    # ===============================
+    # FVG
+    # ===============================
+    fvg = None
+    if abs(last["high"] - prev["low"]) > 0.002:
+        fvg = "Bullish FVG"
+    elif abs(prev["high"] - last["low"]) > 0.002:
+        fvg = "Bearish FVG"
+
+    # ===============================
+    # SNIPER MODE (STRICT)
+    # ===============================
+    sniper = None
+
+    if trend == "BUY" and rsi_signal == "BUY" and liquidity:
+        sniper = "BUY"
+    elif trend == "SELL" and rsi_signal == "SELL" and liquidity:
+        sniper = "SELL"
+
+    # ===============================
+    # FINAL SIGNAL LOGIC
+    # ===============================
+    signal = None
+    strength = "WEAK"
+
+    if sniper:
+        signal = sniper
+        strength = "SNIPER 💀"
+    elif trend == rsi_signal:
+        signal = trend
+        strength = "STRONG"
+    else:
+        signal = trend
+
+    if signal is None:
+        return {"message": "No valid setup"}
+
+    entry = last["close"]
+
+    # Dynamic SL/TP
+    if signal == "BUY":
+        sl = entry * 0.995
+        tp = entry * 1.02
+    else:
+        sl = entry * 1.005
+        tp = entry * 0.98
+
+    # ===============================
+    # CONFIDENCE
+    # ===============================
+    confidence = 60
+    if trend == rsi_signal:
+        confidence += 15
+    if liquidity:
+        confidence += 10
+    if fvg:
+        confidence += 10
+    if strength == "SNIPER 💀":
+        confidence = 95
 
     return {
-        "action": trend,
-        "entry": round(last["close"], 2),
-        "sl": round(last["close"] * 0.995, 2),
-        "tp": round(last["close"] * 1.02, 2),
+        "action": signal,
+        "entry": round(entry, 4),
+        "sl": round(sl, 4),
+        "tp": round(tp, 4),
         "confidence": f"{confidence}%",
         "strength": strength,
-        "reason": f"{trend} | {liquidity_text} | {fvg_text} | RSI={round(last['rsi'],1)}"
+        "reason": f"{trend} | {liquidity} | {fvg} | RSI={round(last['rsi'],1)}"
     }
 
 # ===============================
@@ -111,7 +153,7 @@ def analyze(df_5m, df_15m):
 # ===============================
 @app.route('/')
 def home():
-    return "NEYLA.fx LIVE ENGINE 🚀"
+    return "NEYLA.fx API is running 🚀"
 
 @app.route('/signals')
 def signals():
@@ -119,14 +161,10 @@ def signals():
 
     for name, symbol in PAIRS.items():
         try:
-            df_5m = get_data(symbol, "5m")
-            df_15m = get_data(symbol, "15m")
-
-            signal = analyze(df_5m, df_15m)
+            df = get_data(symbol)
+            signal = analyze(df)
             signal["pair"] = name
-
             results.append(signal)
-
         except Exception as e:
             results.append({
                 "pair": name,
