@@ -20,10 +20,10 @@ PAIRS = {
 }
 
 # ===============================
-# FETCH DATA (TWELVEDATA)
+# FETCH DATA
 # ===============================
-def get_data(symbol):
-    url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval=5min&outputsize=100&apikey={API_KEY}"
+def get_data(symbol, interval):
+    url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval={interval}&outputsize=100&apikey={API_KEY}"
 
     response = requests.get(url, timeout=10)
     data = response.json()
@@ -41,7 +41,7 @@ def get_data(symbol):
     return df
 
 # ===============================
-# ANALYSIS ENGINE (BALANCED)
+# ANALYSIS FUNCTION
 # ===============================
 def analyze(df):
     df["rsi"] = ta.momentum.RSIIndicator(df["close"]).rsi()
@@ -51,53 +51,53 @@ def analyze(df):
     last = df.iloc[-1]
     prev = df.iloc[-2]
 
-    # TREND
     trend = "BUY" if last["ema20"] > last["ema50"] else "SELL"
-
     rsi = last["rsi"]
 
-    # LIQUIDITY
     liquidity = None
     if last["low"] < prev["low"]:
         liquidity = "SELL_SIDE"
     elif last["high"] > prev["high"]:
         liquidity = "BUY_SIDE"
 
-    # FVG
     fvg = None
     if last["low"] > prev["high"]:
         fvg = "BULLISH"
     elif last["high"] < prev["low"]:
         fvg = "BEARISH"
 
-    # ===============================
-    # BALANCED SIGNAL LOGIC
-    # ===============================
+    return {
+        "trend": trend,
+        "rsi": rsi,
+        "liquidity": liquidity,
+        "fvg": fvg,
+        "close": last["close"]
+    }
+
+# ===============================
+# MULTI-TIMEFRAME ENGINE
+# ===============================
+def generate_signal(df_5m, df_15m):
+    a5 = analyze(df_5m)
+    a15 = analyze(df_15m)
+
+    trend_5m = a5["trend"]
+    trend_15m = a15["trend"]
+
+    rsi = a5["rsi"]
+    liquidity = a5["liquidity"]
+    fvg = a5["fvg"]
+    entry = a5["close"]
+
     signal = None
-    strength = "NONE"
+    strength = None
 
-    # NORMAL TRADES (MORE FREQUENT)
+    # ===============================
+    # SNIPER (BOTH TIMEFRAMES AGREE)
+    # ===============================
     if (
-        trend == "BUY"
-        and rsi < 50
-        and liquidity == "SELL_SIDE"
-        and (fvg == "BULLISH" or fvg is None)
-    ):
-        signal = "BUY"
-        strength = "STRONG"
-
-    elif (
-        trend == "SELL"
-        and rsi > 50
-        and liquidity == "BUY_SIDE"
-        and (fvg == "BEARISH" or fvg is None)
-    ):
-        signal = "SELL"
-        strength = "STRONG"
-
-    # SNIPER MODE (RARE BUT POWERFUL)
-    if (
-        trend == "BUY"
+        trend_5m == "BUY"
+        and trend_15m == "BUY"
         and rsi < 40
         and liquidity == "SELL_SIDE"
         and fvg == "BULLISH"
@@ -106,7 +106,8 @@ def analyze(df):
         strength = "SNIPER 💀"
 
     elif (
-        trend == "SELL"
+        trend_5m == "SELL"
+        and trend_15m == "SELL"
         and rsi > 60
         and liquidity == "BUY_SIDE"
         and fvg == "BEARISH"
@@ -114,26 +115,34 @@ def analyze(df):
         signal = "SELL"
         strength = "SNIPER 💀"
 
-    # NO TRADE
-    if signal is None:
-        return {"message": "No valid setup"}
+    # ===============================
+    # STRONG (TREND CONFIRMED)
+    # ===============================
+    elif trend_5m == trend_15m:
+        signal = trend_5m
+        strength = "STRONG"
 
-    entry = last["close"]
+    # ===============================
+    # SCALP (DIFFERENT TIMEFRAMES)
+    # ===============================
+    else:
+        signal = trend_5m
+        strength = "SCALP ⚡"
 
     # ===============================
     # RISK MANAGEMENT
     # ===============================
     if signal == "BUY":
-        sl = entry * 0.995
-        tp = entry * 1.02
+        sl = entry * 0.997
+        tp = entry * 1.015
     else:
-        sl = entry * 1.005
-        tp = entry * 0.98
+        sl = entry * 1.003
+        tp = entry * 0.985
 
     # CONFIDENCE
-    confidence = 70
+    confidence = 60
     if strength == "STRONG":
-        confidence = 85
+        confidence = 80
     if strength == "SNIPER 💀":
         confidence = 95
 
@@ -144,7 +153,7 @@ def analyze(df):
         "tp": round(tp, 4),
         "confidence": f"{confidence}%",
         "strength": strength,
-        "reason": f"{trend} | {liquidity} | {fvg} | RSI={round(rsi,1)}"
+        "reason": f"5m:{trend_5m} | 15m:{trend_15m} | RSI={round(rsi,1)} | {liquidity} | {fvg}"
     }
 
 # ===============================
@@ -160,10 +169,14 @@ def signals():
 
     for name, symbol in PAIRS.items():
         try:
-            df = get_data(symbol)
-            signal = analyze(df)
+            df_5m = get_data(symbol, "5min")
+            df_15m = get_data(symbol, "15min")
+
+            signal = generate_signal(df_5m, df_15m)
             signal["pair"] = name
+
             results.append(signal)
+
         except Exception as e:
             results.append({
                 "pair": name,
