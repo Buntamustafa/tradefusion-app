@@ -9,17 +9,17 @@ app = Flask(__name__)
 CORS(app)
 
 # ===============================
-# CONFIG (CRYPTO ONLY)
+# CONFIG
 # ===============================
 PAIRS = {
     "BTC/USD": "BTCUSDT"
 }
 
 # ===============================
-# FETCH MARKET DATA (BINANCE US)
+# FETCH DATA (MULTI TIMEFRAME)
 # ===============================
-def get_data(symbol):
-    url = f"https://api.binance.us/api/v3/klines?symbol={symbol}&interval=5m&limit=150"
+def get_data(symbol, interval="5m"):
+    url = f"https://api.binance.us/api/v3/klines?symbol={symbol}&interval={interval}&limit=150"
 
     headers = {
         "User-Agent": "Mozilla/5.0"
@@ -44,23 +44,37 @@ def get_data(symbol):
     return df
 
 # ===============================
-# SMART MONEY ANALYSIS
+# TREND FUNCTION (15m)
 # ===============================
-def analyze(df):
-    df["rsi"] = ta.momentum.RSIIndicator(df["close"]).rsi()
+def get_trend(df):
     df["ema"] = ta.trend.EMAIndicator(df["close"], window=50).ema_indicator()
-
     last = df.iloc[-1]
-    prev = df.iloc[-2]
-    prev2 = df.iloc[-3]
+    return "BUY" if last["close"] > last["ema"] else "SELL"
+
+# ===============================
+# SNIPER ANALYSIS
+# ===============================
+def analyze(df_5m, df_15m):
+    df_5m["rsi"] = ta.momentum.RSIIndicator(df_5m["close"]).rsi()
+    df_5m["ema"] = ta.trend.EMAIndicator(df_5m["close"], window=50).ema_indicator()
+
+    last = df_5m.iloc[-1]
+    prev = df_5m.iloc[-2]
+    prev2 = df_5m.iloc[-3]
+
+    trend_5m = "BUY" if last["close"] > last["ema"] else "SELL"
+    trend_15m = get_trend(df_15m)
 
     # ===============================
-    # 1. TREND (STRUCTURE)
+    # REQUIRE TREND ALIGNMENT
     # ===============================
-    trend = "BUY" if last["close"] > last["ema"] else "SELL"
+    if trend_5m != trend_15m:
+        return None
+
+    trend = trend_5m
 
     # ===============================
-    # 2. LIQUIDITY SWEEP
+    # LIQUIDITY SWEEP (MANDATORY)
     # ===============================
     liquidity = None
     if last["low"] < prev["low"] and prev["low"] < prev2["low"]:
@@ -68,8 +82,11 @@ def analyze(df):
     elif last["high"] > prev["high"] and prev["high"] > prev2["high"]:
         liquidity = "Buy-side liquidity swept"
 
+    if not liquidity:
+        return None  # ❌ no trade
+
     # ===============================
-    # 3. FAIR VALUE GAP (REALISTIC)
+    # FVG (MANDATORY)
     # ===============================
     fvg = None
     if prev2["high"] < prev["low"]:
@@ -77,36 +94,23 @@ def analyze(df):
     elif prev2["low"] > prev["high"]:
         fvg = "Bearish FVG"
 
+    if not fvg:
+        return None  # ❌ no trade
+
     # ===============================
-    # 4. ENTRY LOGIC (CONFLUENCE)
+    # FINAL SIGNAL
     # ===============================
     signal = trend
 
-    if liquidity and fvg:
-        if "Sell-side" in liquidity and fvg == "Bullish FVG":
-            signal = "BUY"
-        elif "Buy-side" in liquidity and fvg == "Bearish FVG":
-            signal = "SELL"
-
-    # RSI filter
-    if last["rsi"] < 30:
-        signal = "BUY"
-    elif last["rsi"] > 70:
-        signal = "SELL"
-
     # ===============================
-    # 5. CONFIDENCE SYSTEM
+    # CONFIDENCE (STRICT)
     # ===============================
-    confidence = 60
+    confidence = 85
 
-    if signal == trend:
-        confidence += 10
-    if liquidity:
-        confidence += 10
-    if fvg:
-        confidence += 10
-    if (signal == "BUY" and last["rsi"] < 40) or (signal == "SELL" and last["rsi"] > 60):
-        confidence += 10
+    if "liquidity" in liquidity:
+        confidence += 5
+    if "FVG" in fvg:
+        confidence += 5
 
     # ===============================
     # OUTPUT
@@ -117,7 +121,7 @@ def analyze(df):
         "sl": round(last["close"] * 0.995, 2),
         "tp": round(last["close"] * 1.02, 2),
         "confidence": f"{confidence}%",
-        "reason": f"{trend} | {liquidity} | {fvg} | RSI={round(last['rsi'],1)}"
+        "reason": f"{trend} | {liquidity} | {fvg} | MTF aligned"
     }
 
 # ===============================
@@ -125,7 +129,7 @@ def analyze(df):
 # ===============================
 @app.route('/')
 def home():
-    return "NEYLA.fx PRO API is running 🚀"
+    return "NEYLA.fx SNIPER API 🚀"
 
 @app.route('/signals')
 def signals():
@@ -133,10 +137,20 @@ def signals():
 
     for name, symbol in PAIRS.items():
         try:
-            df = get_data(symbol)
-            signal = analyze(df)
-            signal["pair"] = name
-            results.append(signal)
+            df_5m = get_data(symbol, "5m")
+            df_15m = get_data(symbol, "15m")
+
+            signal = analyze(df_5m, df_15m)
+
+            if signal:
+                signal["pair"] = name
+                results.append(signal)
+            else:
+                results.append({
+                    "pair": name,
+                    "message": "No sniper setup"
+                })
+
         except Exception as e:
             results.append({
                 "pair": name,
