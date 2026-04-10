@@ -22,30 +22,34 @@ PAIRS = {
 }
 
 CACHE = {}
-CACHE_DURATION = 60  # seconds
+CACHE_DURATION = 60
 
 # ===============================
-# RETRY SYSTEM
+# SMART RETRY
 # ===============================
 def fetch_with_retry(url, retries=3, delay=2):
     for attempt in range(retries):
         try:
             res = requests.get(url, timeout=10)
+
             if res.status_code == 200:
                 return res.json()
-        except:
-            pass
 
-        time.sleep(delay)
+            print(f"Retry {attempt+1}: {res.status_code}")
 
-    raise Exception("API request failed after retries")
+        except Exception as e:
+            print("Retry error:", e)
+
+        time.sleep(delay * (attempt + 1))
+
+    return None
 
 # ===============================
 # KILL ZONE
 # ===============================
 def in_kill_zone():
-    now = datetime.utcnow().hour
-    return (7 <= now <= 10) or (12 <= now <= 15)
+    hour = datetime.utcnow().hour
+    return (7 <= hour <= 10) or (12 <= hour <= 15)
 
 # ===============================
 # NEWS FILTER
@@ -54,45 +58,107 @@ def high_impact_news():
     try:
         url = f"https://api.twelvedata.com/economic_calendar?importance=high&apikey={API_KEY}"
         res = fetch_with_retry(url)
-        return "data" in res and len(res["data"]) > 0
+        return res and "data" in res and len(res["data"]) > 0
     except:
         return False
 
 # ===============================
-# FETCH DATA
+# BYBIT FALLBACK
+# ===============================
+def fetch_bybit(symbol, interval):
+    try:
+        interval_map = {"5min": "5", "15min": "15"}
+        url = f"https://api.bybit.com/v5/market/kline?category=linear&symbol={symbol}&interval={interval_map[interval]}&limit=100"
+
+        data = fetch_with_retry(url)
+
+        if not data or "result" not in data:
+            return None
+
+        candles = data["result"]["list"]
+
+        df = pd.DataFrame(candles, columns=[
+            "time","open","high","low","close","volume","turnover"
+        ])
+
+        df = df.iloc[::-1]
+
+        df["open"] = df["open"].astype(float)
+        df["close"] = df["close"].astype(float)
+        df["high"] = df["high"].astype(float)
+        df["low"] = df["low"].astype(float)
+
+        return df
+
+    except:
+        return None
+
+# ===============================
+# FETCH DATA (SMART ENGINE)
 # ===============================
 def get_data(symbol, interval, market_type):
     key = f"{symbol}_{interval}"
     now = time.time()
 
-    # CACHE
+    # CACHE FIRST
     if key in CACHE and (now - CACHE[key]["time"] < CACHE_DURATION):
         return CACHE[key]["data"]
 
+    df = None
+
     # ===============================
-    # CRYPTO → BINANCE
+    # CRYPTO FLOW
     # ===============================
     if market_type == "crypto":
-        url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={'5m' if interval=='5min' else '15m'}&limit=100"
-        data = fetch_with_retry(url)
 
-        if not data or len(data) < 50:
-            raise Exception("Binance returned insufficient data")
+        # 1️⃣ BINANCE PRIMARY
+        try:
+            url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={'5m' if interval=='5min' else '15m'}&limit=100"
+            data = fetch_with_retry(url)
 
-        df = pd.DataFrame(data, columns=[
-            "time","open","high","low","close","volume",
-            "close_time","qav","trades","taker_base","taker_quote","ignore"
-        ])
+            if data and len(data) >= 50:
+                df = pd.DataFrame(data, columns=[
+                    "time","open","high","low","close","volume",
+                    "close_time","qav","trades","taker_base","taker_quote","ignore"
+                ])
+        except:
+            pass
+
+        # 2️⃣ BINANCE FALLBACK
+        if df is None:
+            try:
+                url = f"https://api.binance.com/api/v3/uiKlines?symbol={symbol}&interval={'5m' if interval=='5min' else '15m'}&limit=100"
+                data = fetch_with_retry(url)
+
+                if data and len(data) >= 50:
+                    df = pd.DataFrame(data, columns=[
+                        "time","open","high","low","close","volume",
+                        "close_time","qav","trades","taker_base","taker_quote","ignore"
+                    ])
+            except:
+                pass
+
+        # 3️⃣ BYBIT FALLBACK 🔥
+        if df is None:
+            df = fetch_bybit(symbol, interval)
+
+        # 4️⃣ CACHE FALLBACK
+        if df is None:
+            if key in CACHE:
+                print("Using cached crypto data")
+                return CACHE[key]["data"]
+            else:
+                raise Exception("All crypto sources failed")
 
     # ===============================
-    # FOREX → TWELVEDATA
+    # FOREX / GOLD
     # ===============================
     else:
         url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval={interval}&outputsize=100&apikey={API_KEY}"
         res = fetch_with_retry(url)
 
-        if "values" not in res:
-            raise Exception(res.get("message", "Data fetch failed"))
+        if not res or "values" not in res:
+            raise Exception("Forex data failed")
 
         df = pd.DataFrame(res["values"])
         df = df.iloc[::-1]
@@ -109,7 +175,7 @@ def get_data(symbol, interval, market_type):
     return df
 
 # ===============================
-# ENTRY CONFIRMATION
+# CONFIRMATION
 # ===============================
 def confirmation(df):
     if len(df) < 2:
@@ -129,7 +195,7 @@ def confirmation(df):
     return None
 
 # ===============================
-# ANALYSIS (SAFE)
+# ANALYSIS
 # ===============================
 def analyze(df):
     if df is None or len(df) < 50:
@@ -146,35 +212,14 @@ def analyze(df):
     trend = "BUY" if last["ema20"] > last["ema50"] else "SELL"
     rsi = last["rsi"]
 
-    liquidity = None
-    if last["low"] < prev["low"]:
-        liquidity = "SELL_SIDE"
-    elif last["high"] > prev["high"]:
-        liquidity = "BUY_SIDE"
-
-    fvg = None
-    if prev["low"] > prev2["high"]:
-        fvg = "BULLISH"
-    elif prev["high"] < prev2["low"]:
-        fvg = "BEARISH"
-
-    bos = None
-    if last["high"] > prev["high"] and prev["high"] > prev2["high"]:
-        bos = "BULLISH"
-    elif last["low"] < prev["low"] and prev["low"] < prev2["low"]:
-        bos = "BEARISH"
-
     return {
         "trend": trend,
         "rsi": rsi,
-        "liquidity": liquidity,
-        "fvg": fvg,
-        "bos": bos,
         "close": last["close"]
     }
 
 # ===============================
-# SIGNAL ENGINE (STRICT)
+# SIGNAL ENGINE (STRICT SCALP)
 # ===============================
 def generate_signal(df_5m, df_15m):
 
@@ -211,7 +256,7 @@ def generate_signal(df_5m, df_15m):
             "tp": round(tp, 4),
             "confidence": "60%",
             "strength": "SCALP ⚡ (CONFIRMED)",
-            "reason": f"Outside kill zone | Confirmed {signal} | RSI={round(rsi,1)}"
+            "reason": f"Confirmed {signal} | RSI={round(rsi,1)}"
         }
 
     # INSIDE SESSION
@@ -220,10 +265,8 @@ def generate_signal(df_5m, df_15m):
 
     if trend_5m == trend_15m and confirm == trend_5m:
         signal = trend_5m
-        strength = "STRONG"
     elif confirm:
         signal = confirm
-        strength = "SCALP ⚡"
     else:
         return {"message": "Waiting for high-probability setup"}
 
@@ -240,8 +283,8 @@ def generate_signal(df_5m, df_15m):
         "sl": round(sl, 4),
         "tp": round(tp, 4),
         "confidence": "70%",
-        "strength": strength,
-        "reason": f"{strength} | RSI={round(rsi,1)}"
+        "strength": "STRONG",
+        "reason": f"{signal} | RSI={round(rsi,1)}"
     }
 
 # ===============================
@@ -249,7 +292,7 @@ def generate_signal(df_5m, df_15m):
 # ===============================
 @app.route('/')
 def home():
-    return "NEYLA.fx ULTRA STABLE 🚀"
+    return "NEYLA.fx GOD MODE 🔥"
 
 @app.route('/signals')
 def signals():
