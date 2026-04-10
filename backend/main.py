@@ -25,6 +25,22 @@ CACHE = {}
 CACHE_DURATION = 60  # seconds
 
 # ===============================
+# RETRY SYSTEM
+# ===============================
+def fetch_with_retry(url, retries=3, delay=2):
+    for attempt in range(retries):
+        try:
+            res = requests.get(url, timeout=10)
+            if res.status_code == 200:
+                return res.json()
+        except:
+            pass
+
+        time.sleep(delay)
+
+    raise Exception("API request failed after retries")
+
+# ===============================
 # KILL ZONE
 # ===============================
 def in_kill_zone():
@@ -37,13 +53,13 @@ def in_kill_zone():
 def high_impact_news():
     try:
         url = f"https://api.twelvedata.com/economic_calendar?importance=high&apikey={API_KEY}"
-        res = requests.get(url, timeout=5).json()
+        res = fetch_with_retry(url)
         return "data" in res and len(res["data"]) > 0
     except:
         return False
 
 # ===============================
-# FETCH DATA (SMART SOURCE)
+# FETCH DATA
 # ===============================
 def get_data(symbol, interval, market_type):
     key = f"{symbol}_{interval}"
@@ -54,28 +70,26 @@ def get_data(symbol, interval, market_type):
         return CACHE[key]["data"]
 
     # ===============================
-    # CRYPTO → BINANCE (NO LIMIT)
+    # CRYPTO → BINANCE
     # ===============================
     if market_type == "crypto":
         url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={'5m' if interval=='5min' else '15m'}&limit=100"
-        data = requests.get(url, timeout=10).json()
+        data = fetch_with_retry(url)
+
+        if not data or len(data) < 50:
+            raise Exception("Binance returned insufficient data")
 
         df = pd.DataFrame(data, columns=[
             "time","open","high","low","close","volume",
             "close_time","qav","trades","taker_base","taker_quote","ignore"
         ])
 
-        df["open"] = df["open"].astype(float)
-        df["close"] = df["close"].astype(float)
-        df["high"] = df["high"].astype(float)
-        df["low"] = df["low"].astype(float)
-
     # ===============================
-    # FOREX / GOLD → TWELVEDATA
+    # FOREX → TWELVEDATA
     # ===============================
     else:
         url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval={interval}&outputsize=100&apikey={API_KEY}"
-        res = requests.get(url, timeout=10).json()
+        res = fetch_with_retry(url)
 
         if "values" not in res:
             raise Exception(res.get("message", "Data fetch failed"))
@@ -83,10 +97,11 @@ def get_data(symbol, interval, market_type):
         df = pd.DataFrame(res["values"])
         df = df.iloc[::-1]
 
-        df["open"] = df["open"].astype(float)
-        df["close"] = df["close"].astype(float)
-        df["high"] = df["high"].astype(float)
-        df["low"] = df["low"].astype(float)
+    # FORMAT
+    df["open"] = df["open"].astype(float)
+    df["close"] = df["close"].astype(float)
+    df["high"] = df["high"].astype(float)
+    df["low"] = df["low"].astype(float)
 
     # SAVE CACHE
     CACHE[key] = {"data": df, "time": now}
@@ -97,6 +112,9 @@ def get_data(symbol, interval, market_type):
 # ENTRY CONFIRMATION
 # ===============================
 def confirmation(df):
+    if len(df) < 2:
+        return None
+
     last = df.iloc[-1]
 
     body = abs(last["close"] - last["open"])
@@ -111,9 +129,12 @@ def confirmation(df):
     return None
 
 # ===============================
-# ANALYSIS
+# ANALYSIS (SAFE)
 # ===============================
 def analyze(df):
+    if df is None or len(df) < 50:
+        raise Exception("Not enough market data")
+
     df["rsi"] = ta.momentum.RSIIndicator(df["close"]).rsi()
     df["ema20"] = ta.trend.EMAIndicator(df["close"], window=20).ema_indicator()
     df["ema50"] = ta.trend.EMAIndicator(df["close"], window=50).ema_indicator()
@@ -153,7 +174,7 @@ def analyze(df):
     }
 
 # ===============================
-# SIGNAL ENGINE
+# SIGNAL ENGINE (STRICT)
 # ===============================
 def generate_signal(df_5m, df_15m):
 
@@ -164,14 +185,9 @@ def generate_signal(df_5m, df_15m):
     trend_5m = a5["trend"]
     trend_15m = a15["trend"]
     rsi = a5["rsi"]
-    liquidity = a5["liquidity"]
-    fvg = a5["fvg"]
-    bos = a5["bos"]
     entry = a5["close"]
 
-    # ===============================
-    # SCALP OUTSIDE SESSION (STRICT)
-    # ===============================
+    # OUTSIDE SESSION → STRICT SCALP
     if not in_kill_zone():
 
         if trend_5m == "BUY" and rsi < 60 and confirm == "BUY":
@@ -198,36 +214,16 @@ def generate_signal(df_5m, df_15m):
             "reason": f"Outside kill zone | Confirmed {signal} | RSI={round(rsi,1)}"
         }
 
-    # ===============================
-    # NEWS FILTER
-    # ===============================
+    # INSIDE SESSION
     if high_impact_news():
         return {"message": "High impact news - stay out"}
 
-    signal = None
-    strength = None
-
-    # SNIPER
-    if (
-        trend_5m == trend_15m
-        and liquidity
-        and fvg
-        and bos
-        and confirm == trend_5m
-    ):
-        signal = trend_5m
-        strength = "SNIPER 💀"
-
-    # STRONG
-    elif trend_5m == trend_15m and confirm == trend_5m:
+    if trend_5m == trend_15m and confirm == trend_5m:
         signal = trend_5m
         strength = "STRONG"
-
-    # SCALP
     elif confirm:
         signal = confirm
         strength = "SCALP ⚡"
-
     else:
         return {"message": "Waiting for high-probability setup"}
 
@@ -238,18 +234,12 @@ def generate_signal(df_5m, df_15m):
         sl = entry * 1.003
         tp = entry * 0.98
 
-    confidence = 60
-    if strength == "STRONG":
-        confidence = 80
-    if strength == "SNIPER 💀":
-        confidence = 95
-
     return {
         "action": signal,
         "entry": round(entry, 4),
         "sl": round(sl, 4),
         "tp": round(tp, 4),
-        "confidence": f"{confidence}%",
+        "confidence": "70%",
         "strength": strength,
         "reason": f"{strength} | RSI={round(rsi,1)}"
     }
@@ -259,7 +249,7 @@ def generate_signal(df_5m, df_15m):
 # ===============================
 @app.route('/')
 def home():
-    return "NEYLA.fx ULTRA ENGINE 🚀"
+    return "NEYLA.fx ULTRA STABLE 🚀"
 
 @app.route('/signals')
 def signals():
