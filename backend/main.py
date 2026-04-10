@@ -4,6 +4,7 @@ import requests
 import pandas as pd
 import ta
 import os
+import time
 from datetime import datetime
 
 app = Flask(__name__)
@@ -15,10 +16,13 @@ CORS(app)
 API_KEY = os.getenv("TWELVE_API_KEY")
 
 PAIRS = {
-    "EUR/USD": "EUR/USD",
-    "BTC/USD": "BTC/USD",
-    "XAU/USD": "XAU/USD"
+    "EUR/USD": {"type": "forex", "symbol": "EUR/USD"},
+    "BTC/USD": {"type": "crypto", "symbol": "BTCUSDT"},
+    "XAU/USD": {"type": "forex", "symbol": "XAU/USD"}
 }
+
+CACHE = {}
+CACHE_DURATION = 60  # seconds
 
 # ===============================
 # KILL ZONE
@@ -39,27 +43,58 @@ def high_impact_news():
         return False
 
 # ===============================
-# FETCH DATA
+# FETCH DATA (SMART SOURCE)
 # ===============================
-def get_data(symbol, interval):
-    url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval={interval}&outputsize=100&apikey={API_KEY}"
-    res = requests.get(url, timeout=10).json()
+def get_data(symbol, interval, market_type):
+    key = f"{symbol}_{interval}"
+    now = time.time()
 
-    if "values" not in res:
-        raise Exception(res.get("message", "Data fetch failed"))
+    # CACHE
+    if key in CACHE and (now - CACHE[key]["time"] < CACHE_DURATION):
+        return CACHE[key]["data"]
 
-    df = pd.DataFrame(res["values"])
-    df = df.iloc[::-1]
+    # ===============================
+    # CRYPTO → BINANCE (NO LIMIT)
+    # ===============================
+    if market_type == "crypto":
+        url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={'5m' if interval=='5min' else '15m'}&limit=100"
+        data = requests.get(url, timeout=10).json()
 
-    df["open"] = df["open"].astype(float)
-    df["close"] = df["close"].astype(float)
-    df["high"] = df["high"].astype(float)
-    df["low"] = df["low"].astype(float)
+        df = pd.DataFrame(data, columns=[
+            "time","open","high","low","close","volume",
+            "close_time","qav","trades","taker_base","taker_quote","ignore"
+        ])
+
+        df["open"] = df["open"].astype(float)
+        df["close"] = df["close"].astype(float)
+        df["high"] = df["high"].astype(float)
+        df["low"] = df["low"].astype(float)
+
+    # ===============================
+    # FOREX / GOLD → TWELVEDATA
+    # ===============================
+    else:
+        url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval={interval}&outputsize=100&apikey={API_KEY}"
+        res = requests.get(url, timeout=10).json()
+
+        if "values" not in res:
+            raise Exception(res.get("message", "Data fetch failed"))
+
+        df = pd.DataFrame(res["values"])
+        df = df.iloc[::-1]
+
+        df["open"] = df["open"].astype(float)
+        df["close"] = df["close"].astype(float)
+        df["high"] = df["high"].astype(float)
+        df["low"] = df["low"].astype(float)
+
+    # SAVE CACHE
+    CACHE[key] = {"data": df, "time": now}
 
     return df
 
 # ===============================
-# ENTRY CONFIRMATION (WICKS)
+# ENTRY CONFIRMATION
 # ===============================
 def confirmation(df):
     last = df.iloc[-1]
@@ -68,11 +103,8 @@ def confirmation(df):
     upper_wick = last["high"] - max(last["open"], last["close"])
     lower_wick = min(last["open"], last["close"]) - last["low"]
 
-    # Bullish rejection
     if lower_wick > body * 1.5:
         return "BUY"
-
-    # Bearish rejection
     if upper_wick > body * 1.5:
         return "SELL"
 
@@ -138,7 +170,7 @@ def generate_signal(df_5m, df_15m):
     entry = a5["close"]
 
     # ===============================
-    # ⚡ SCALP OUTSIDE SESSION (FILTERED)
+    # SCALP OUTSIDE SESSION (STRICT)
     # ===============================
     if not in_kill_zone():
 
@@ -147,7 +179,7 @@ def generate_signal(df_5m, df_15m):
         elif trend_5m == "SELL" and rsi > 40 and confirm == "SELL":
             signal = "SELL"
         else:
-            return {"message": "No clean scalp"}
+            return {"message": "Waiting for high-probability setup"}
 
         if signal == "BUY":
             sl = entry * 0.997
@@ -175,56 +207,30 @@ def generate_signal(df_5m, df_15m):
     signal = None
     strength = None
 
-    # ===============================
-    # 💀 SNIPER (WITH CONFIRMATION)
-    # ===============================
+    # SNIPER
     if (
-        trend_5m == "BUY"
-        and trend_15m == "BUY"
-        and liquidity == "SELL_SIDE"
-        and fvg == "BULLISH"
-        and bos == "BULLISH"
-        and rsi < 45
-        and confirm == "BUY"
-    ):
-        signal = "BUY"
-        strength = "SNIPER 💀"
-
-    elif (
-        trend_5m == "SELL"
-        and trend_15m == "SELL"
-        and liquidity == "BUY_SIDE"
-        and fvg == "BEARISH"
-        and bos == "BEARISH"
-        and rsi > 55
-        and confirm == "SELL"
-    ):
-        signal = "SELL"
-        strength = "SNIPER 💀"
-
-    # ===============================
-    # 💪 STRONG
-    # ===============================
-    elif (
         trend_5m == trend_15m
+        and liquidity
+        and fvg
+        and bos
         and confirm == trend_5m
     ):
         signal = trend_5m
+        strength = "SNIPER 💀"
+
+    # STRONG
+    elif trend_5m == trend_15m and confirm == trend_5m:
+        signal = trend_5m
         strength = "STRONG"
 
-    # ===============================
-    # ⚡ SCALP (INSIDE SESSION)
-    # ===============================
-    else:
-        if confirm:
-            signal = confirm
-            strength = "SCALP ⚡"
-        else:
-            return {"message": "No valid setup"}
+    # SCALP
+    elif confirm:
+        signal = confirm
+        strength = "SCALP ⚡"
 
-    # ===============================
-    # RISK
-    # ===============================
+    else:
+        return {"message": "Waiting for high-probability setup"}
+
     if signal == "BUY":
         sl = entry * 0.997
         tp = entry * 1.02
@@ -245,7 +251,7 @@ def generate_signal(df_5m, df_15m):
         "tp": round(tp, 4),
         "confidence": f"{confidence}%",
         "strength": strength,
-        "reason": f"{strength} | Confirmed | 5m:{trend_5m} | 15m:{trend_15m} | RSI={round(rsi,1)}"
+        "reason": f"{strength} | RSI={round(rsi,1)}"
     }
 
 # ===============================
@@ -253,16 +259,16 @@ def generate_signal(df_5m, df_15m):
 # ===============================
 @app.route('/')
 def home():
-    return "NEYLA.fx PRECISION AI is running 🚀"
+    return "NEYLA.fx ULTRA ENGINE 🚀"
 
 @app.route('/signals')
 def signals():
     results = []
 
-    for name, symbol in PAIRS.items():
+    for name, info in PAIRS.items():
         try:
-            df_5m = get_data(symbol, "5min")
-            df_15m = get_data(symbol, "15min")
+            df_5m = get_data(info["symbol"], "5min", info["type"])
+            df_15m = get_data(info["symbol"], "15min", info["type"])
 
             signal = generate_signal(df_5m, df_15m)
             signal["pair"] = name
