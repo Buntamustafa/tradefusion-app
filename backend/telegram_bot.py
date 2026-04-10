@@ -6,6 +6,7 @@ CHAT_ID = os.getenv("CHAT_ID")
 
 def send_telegram(message):
     if not BOT_TOKEN or not CHAT_ID:
+        print("Missing Telegram credentials")
         return
 
     try:
