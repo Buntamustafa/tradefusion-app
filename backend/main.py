@@ -1,336 +1,171 @@
 from flask import Flask, jsonify
 from flask_cors import CORS
-import requests, pandas as pd, os, time
-from datetime import datetime
+import pandas as pd
+import yfinance as yf
+from telegram_bot import send_telegram
 
 app = Flask(__name__)
 CORS(app)
 
-API_KEY = os.getenv("TWELVE_API_KEY")
-
-CACHE = {}
-CACHE_TTL = 60
-
 PAIRS = {
-    "EUR/USD": "EURUSD",
-    "BTC/USD": "BTCUSDT",
-    "XAU/USD": "XAUUSD"
+    "EURUSD": "EURUSD=X",
+    "GBPUSD": "GBPUSD=X",
+    "USDCAD": "CAD=X",
+    "XAUUSD": "GC=F",
+    "BTCUSD": "BTC-USD"
 }
 
-# ===============================
-# CACHE
-# ===============================
-def get_cache(pair):
-    if pair in CACHE:
-        data, t = CACHE[pair]
-        if time.time() - t < CACHE_TTL:
-            return data
-    return None
-
-def set_cache(pair, data):
-    CACHE[pair] = (data, time.time())
-
-# ===============================
-# SAFE REQUEST (RETRY)
-# ===============================
-def safe_request(url, retries=3):
-    for _ in range(retries):
-        try:
-            res = requests.get(url, timeout=5)
-            if res.status_code == 200:
-                return res.json()
-        except:
-            time.sleep(1)
-    return None
-
-# ===============================
-# DATA SOURCES
-# ===============================
-def get_binance(symbol, tf="5m"):
-    url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={tf}&limit=100"
-    data = safe_request(url)
-
-    if not data or isinstance(data, dict):
-        return None
-
-    df = pd.DataFrame(data)
-    df = df.iloc[:, :6]
-    df.columns = ["time","open","high","low","close","volume"]
-    df = df.astype(float)
-
-    return df
-
-def get_yahoo(pair, tf="5m"):
+# =========================
+# DATA FETCH
+# =========================
+def get_data(symbol, interval="5m"):
     try:
-        import yfinance as yf
-
-        mapping = {
-            "EUR/USD": "EURUSD=X",
-            "XAU/USD": "GC=F",
-            "BTC/USD": "BTC-USD"
-        }
-
-        period = "1d" if tf == "5m" else "2d"
-
-        df = yf.download(mapping[pair], interval=tf, period=period)
-
-        if df.empty:
-            return None
-
-        df = df.reset_index()
-        df.columns = ["time","open","high","low","close","volume"]
-
+        df = yf.download(symbol, period="1d", interval=interval)
+        df.dropna(inplace=True)
         return df
     except:
         return None
 
-def get_twelve(symbol):
-    if not API_KEY:
-        return None
+# =========================
+# MARKET STRUCTURE (BOS)
+# =========================
+def detect_bos(df):
+    highs = df['High']
+    lows = df['Low']
 
-    url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval=5min&outputsize=100&apikey={API_KEY}"
-    data = safe_request(url)
-
-    if not data or "values" not in data:
-        return None
-
-    df = pd.DataFrame(data["values"])
-    df = df.astype(float)
-
-    return df
-
-# ===============================
-# 🔥 DATA PIPELINE (REAL HYBRID)
-# ===============================
-def get_data(pair, symbol):
-    cached = get_cache(pair)
-    if cached is not None:
-        return cached
-
-    sources = [
-        lambda: get_binance(symbol),
-        lambda: get_yahoo(pair),
-        lambda: get_twelve(symbol)
-    ]
-
-    for source in sources:
-        df = source()
-        if df is not None and not df.empty:
-            set_cache(pair, df)
-            return df
-
+    if highs.iloc[-1] > highs.iloc[-5:-1].max():
+        return "bullish"
+    elif lows.iloc[-1] < lows.iloc[-5:-1].min():
+        return "bearish"
     return None
 
-def get_htf_data(pair, symbol):
-    sources = [
-        lambda: get_binance(symbol, "1h"),
-        lambda: get_yahoo(pair, "1h")
-    ]
-
-    for source in sources:
-        df = source()
-        if df is not None and not df.empty:
-            return df
-
-    return None
-
-# ===============================
-# SESSION FILTER
-# ===============================
-def get_session():
-    hour = datetime.utcnow().hour
-    if 7 <= hour <= 11:
-        return "LONDON"
-    elif 13 <= hour <= 17:
-        return "NEW_YORK"
-    return "OFF"
-
-# ===============================
-# FILTERS
-# ===============================
-def volatility_filter(df):
-    atr = (df["high"] - df["low"]).rolling(14).mean().iloc[-1]
-    avg = df["close"].rolling(50).std().iloc[-1]
-    return avg * 0.3 < atr < avg * 3
-
-def spread_filter(df):
-    spread = df["high"].iloc[-1] - df["low"].iloc[-1]
-    avg = (df["high"] - df["low"]).rolling(20).mean().iloc[-1]
-    return spread < avg * 2
-
-def news_filter(df):
-    move = abs(df["close"].iloc[-1] - df["close"].iloc[-2])
-    return move > df["close"].std() * 2
-
-# ===============================
-# HTF BIAS
-# ===============================
-def get_htf_bias(df):
-    if df is None or len(df) < 50:
-        return None
-
-    ma = df["close"].rolling(50).mean().iloc[-1]
-    price = df["close"].iloc[-1]
-
-    if price > ma:
-        return "BUY"
-    elif price < ma:
-        return "SELL"
-
-    return None
-
-# ===============================
-# SMART MONEY LOGIC
-# ===============================
-def liquidity_sweep(df):
-    high = df["high"].rolling(10).max().iloc[-2]
-    low = df["low"].rolling(10).min().iloc[-2]
-    last = df.iloc[-1]
-
-    if last["high"] > high:
-        return "BUY"
-    elif last["low"] < low:
-        return "SELL"
-
-    return None
-
-def fvg_zone(df):
+# =========================
+# FAIR VALUE GAP (FVG)
+# =========================
+def detect_fvg(df):
     for i in range(len(df)-3, len(df)-1):
-        if df["low"].iloc[i] > df["high"].iloc[i-2]:
-            return ("BUY", df["high"].iloc[i-2], df["low"].iloc[i])
-        if df["high"].iloc[i] < df["low"].iloc[i-2]:
-            return ("SELL", df["low"].iloc[i-2], df["high"].iloc[i])
+        if df['Low'].iloc[i] > df['High'].iloc[i-1]:
+            return "bullish"
+        if df['High'].iloc[i] < df['Low'].iloc[i-1]:
+            return "bearish"
     return None
 
-def order_block_zone(df):
-    last = df.iloc[-1]
-    prev = df.iloc[-2]
+# =========================
+# ORDER BLOCK
+# =========================
+def detect_ob(df):
+    last = df.iloc[-2]
 
-    if last["close"] > prev["high"]:
-        return ("BUY", prev["low"], prev["high"])
-    if last["close"] < prev["low"]:
-        return ("SELL", prev["high"], prev["low"])
+    if last['Close'] > last['Open']:
+        return "bullish"
+    elif last['Close'] < last['Open']:
+        return "bearish"
+    return None
+
+# =========================
+# VOLATILITY FILTER
+# =========================
+def volatility_ok(df):
+    range_avg = (df['High'] - df['Low']).rolling(10).mean().iloc[-1]
+    return range_avg > 0.0005  # adjust per asset
+
+# =========================
+# SPREAD FILTER (approx)
+# =========================
+def spread_ok(df):
+    spread = abs(df['Close'].iloc[-1] - df['Open'].iloc[-1])
+    return spread < 0.002
+
+# =========================
+# MULTI TIMEFRAME ALIGNMENT
+# =========================
+def mtf_alignment(symbol):
+    df_15m = get_data(symbol, "15m")
+    df_5m = get_data(symbol, "5m")
+
+    if df_15m is None or df_5m is None:
+        return None
+
+    bos_15 = detect_bos(df_15m)
+    bos_5 = detect_bos(df_5m)
+
+    if bos_15 == bos_5:
+        return bos_5
 
     return None
 
-def candle_confirm(df):
-    last = df.iloc[-1]
-    prev = df.iloc[-2]
+# =========================
+# SNIPER ENGINE
+# =========================
+def sniper_signal(pair, symbol):
+    df = get_data(symbol)
 
-    if last["close"] > last["open"] and prev["close"] < prev["open"]:
-        return "BUY"
-    if last["close"] < last["open"] and prev["close"] > prev["open"]:
-        return "SELL"
-
-    return None
-
-# ===============================
-# SNIPER ENTRY
-# ===============================
-def sniper_entry(df, direction, zone_low, zone_high):
-    price = df["close"].iloc[-1]
-    last = df.iloc[-1]
-    prev = df.iloc[-2]
-
-    if direction == "BUY":
-        if not (zone_low <= price <= zone_high):
-            return False
-    else:
-        if not (zone_high <= price <= zone_low):
-            return False
-
-    body = abs(last["close"] - last["open"])
-    wick = (last["high"] - last["low"]) - body
-    rejection = wick > body * 1.5
-
-    if direction == "BUY":
-        structure = last["close"] > prev["high"]
-    else:
-        structure = last["close"] < prev["low"]
-
-    return rejection and structure
-
-# ===============================
-# ENGINE
-# ===============================
-def generate_signal(df, htf_df):
     if df is None or len(df) < 20:
-        return None
+        return {"pair": pair, "message": "No data"}
 
-    if news_filter(df):
-        return None
+    direction = mtf_alignment(symbol)
+    fvg = detect_fvg(df)
+    ob = detect_ob(df)
 
-    if not volatility_filter(df):
-        return None
+    if not volatility_ok(df):
+        return {"pair": pair, "message": "Low volatility"}
 
-    if not spread_filter(df):
-        return None
+    if not spread_ok(df):
+        return {"pair": pair, "message": "High spread"}
 
-    if get_session() == "OFF":
-        return None
+    price = df['Close'].iloc[-1]
 
-    htf_bias = get_htf_bias(htf_df)
-    if not htf_bias:
-        return None
+    # 🎯 PERFECT SNIPER
+    if direction and direction == fvg == ob:
+        msg = f"""
+🔥 SNIPER TRADE
+Pair: {pair}
+Direction: {direction.upper()}
+Entry: {round(price, 5)}
+        """
+        send_telegram(msg)
 
-    liq = liquidity_sweep(df)
-    fvg = fvg_zone(df)
-    ob = order_block_zone(df)
-    confirm = candle_confirm(df)
+        return {
+            "pair": pair,
+            "type": "SNIPER",
+            "direction": direction,
+            "entry": price
+        }
 
-    if not (liq and fvg and ob and confirm):
-        return None
+    # ⚠️ EARLY ALERT (UPGRADE SNIPER)
+    confluence = [direction, fvg, ob]
+    if confluence.count(direction) >= 2 and direction is not None:
+        msg = f"""
+⚠️ ALMOST SNIPER
+Pair: {pair}
+Bias: {direction.upper()}
+Wait for confirmation...
+        """
+        send_telegram(msg)
 
-    if not (liq == fvg[0] == ob[0] == confirm == htf_bias):
-        return None
+        return {
+            "pair": pair,
+            "type": "EARLY",
+            "direction": direction
+        }
 
-    zone_low = min(fvg[1], ob[1])
-    zone_high = max(fvg[2], ob[2])
+    return {"pair": pair, "message": "No sniper setup"}
 
-    if not sniper_entry(df, liq, zone_low, zone_high):
-        return None
-
-    return {
-        "direction": liq,
-        "zone_low": round(zone_low, 5),
-        "zone_high": round(zone_high, 5),
-        "htf_bias": htf_bias
-    }
-
-# ===============================
-# ROUTES
-# ===============================
-@app.route("/signals")
-def signals():
+# =========================
+# API ROUTE
+# =========================
+@app.route("/")
+def home():
     results = []
 
     for pair, symbol in PAIRS.items():
-        df = get_data(pair, symbol)
-        htf_df = get_htf_data(pair, symbol)
-
-        if df is None or htf_df is None:
-            results.append({"pair": pair, "message": "No data"})
-            continue
-
-        signal = generate_signal(df, htf_df)
-
-        if signal:
-            results.append({
-                "pair": pair,
-                "action": signal["direction"],
-                "entry_zone": [signal["zone_low"], signal["zone_high"]],
-                "htf_bias": signal["htf_bias"],
-                "session": get_session(),
-                "confidence": "95% 🔥"
-            })
-        else:
-            results.append({
-                "pair": pair,
-                "message": "No sniper setup"
-            })
+        result = sniper_signal(pair, symbol)
+        results.append(result)
 
     return jsonify(results)
 
-@app.route("/")
-def home():
-    return "TradeFusion Hybrid Sniper Running 🚀"
+# =========================
+# RUN
+# =========================
+if __name__ == "__main__":
+    app.run()
