@@ -4,6 +4,7 @@ import pandas as pd
 import time
 import threading
 import schedule
+import os
 
 from telegram_bot import send_telegram
 
@@ -13,7 +14,6 @@ app = Flask(__name__)
 # SETTINGS
 # =========================
 SYMBOLS = ["EURUSD=X", "GBPUSD=X", "XAUUSD=X"]
-
 
 # =========================
 # ROUTE (RENDER NEEDS THIS)
@@ -159,10 +159,20 @@ def run_bot():
 
 
 # =========================
-# START BACKGROUND THREAD
+# SAFE THREAD START
 # =========================
+bot_started = False
+
 def start_background():
-    threading.Thread(target=run_bot, daemon=True).start()
+    global bot_started
+    if not bot_started:
+        bot_started = True
+        print("Starting bot thread...")
+        threading.Thread(target=run_bot, daemon=True).start()
 
 
-start_background()
+# =========================
+# START (SAFE FOR RENDER)
+# =========================
+if os.environ.get("RUN_MAIN") == "true" or not app.debug:
+    start_background()
