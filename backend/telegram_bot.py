@@ -11,12 +11,10 @@ def send_telegram(message):
 
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
 
-    payload = {
-        "chat_id": CHAT_ID,
-        "text": message
-    }
-
     try:
-        requests.post(url, json=payload, timeout=5)
+        requests.post(url, json={
+            "chat_id": CHAT_ID,
+            "text": message
+        }, timeout=5)
     except:
         pass
