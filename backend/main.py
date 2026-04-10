@@ -5,13 +5,11 @@ import pandas as pd
 import ta
 import os
 import time
+from datetime import datetime
 
 app = Flask(__name__)
 CORS(app)
 
-# ===============================
-# CONFIG
-# ===============================
 PAIRS = {
     "EUR/USD": {"type": "forex", "symbol": "EUR/USD"},
     "BTC/USD": {"type": "crypto", "symbol": "BTCUSDT"},
@@ -21,6 +19,7 @@ PAIRS = {
 API_KEY = os.getenv("TWELVE_API_KEY")
 
 CACHE = {}
+TRADES = {}  # store active trades
 CACHE_TIME = 60
 
 # ===============================
@@ -37,79 +36,47 @@ def set_cache(key, value):
     CACHE[key] = (value, time.time())
 
 # ===============================
-# FETCH FOREX
+# FETCH DATA
 # ===============================
 def fetch_twelve(symbol):
-    url = "https://api.twelvedata.com/time_series"
-    params = {
-        "symbol": symbol,
-        "interval": "5min",
-        "apikey": API_KEY,
-        "outputsize": 100
-    }
+    try:
+        url = "https://api.twelvedata.com/time_series"
+        params = {"symbol": symbol,"interval": "5min","apikey": API_KEY,"outputsize": 100}
+        data = requests.get(url, params=params).json()
 
-    for _ in range(3):
-        try:
-            r = requests.get(url, params=params, timeout=10)
-            data = r.json()
+        if "values" not in data:
+            return None
 
-            if "values" not in data:
-                time.sleep(1)
-                continue
+        df = pd.DataFrame(data["values"]).iloc[::-1]
 
-            df = pd.DataFrame(data["values"]).iloc[::-1]
+        for col in ["open","close","high","low"]:
+            df[col] = df[col].astype(float)
 
-            for col in ["close", "high", "low"]:
-                df[col] = df[col].astype(float)
+        return df
+    except:
+        return None
 
-            if len(df) >= 50:
-                return df
-        except:
-            time.sleep(1)
-
-    return None
-
-# ===============================
-# FETCH CRYPTO (BINANCE)
-# ===============================
 def fetch_binance(symbol):
-    urls = [
-        f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval=5m&limit=100",
-        f"https://api.binance.com/api/v3/uiKlines?symbol={symbol}&interval=5m&limit=100"
-    ]
+    try:
+        url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval=5m&limit=100"
+        data = requests.get(url).json()
 
-    for url in urls:
-        for _ in range(2):
-            try:
-                r = requests.get(url, timeout=10)
-                data = r.json()
+        df = pd.DataFrame(data, columns=[
+            "time","open","high","low","close","volume",
+            "close_time","qav","trades","taker_base","taker_quote","ignore"
+        ])
 
-                if isinstance(data, list) and len(data) > 50:
-                    df = pd.DataFrame(data, columns=[
-                        "time","open","high","low","close","volume",
-                        "close_time","qav","trades","taker_base","taker_quote","ignore"
-                    ])
+        for col in ["open","close","high","low"]:
+            df[col] = df[col].astype(float)
 
-                    for col in ["open","close","high","low"]:
-                        df[col] = df[col].astype(float)
+        return df
+    except:
+        return None
 
-                    return df
-            except:
-                time.sleep(1)
-
-    return None
-
-# ===============================
-# FETCH CRYPTO (BYBIT)
-# ===============================
 def fetch_bybit(symbol):
     try:
         url = f"https://api.bybit.com/v5/market/kline?category=linear&symbol={symbol}&interval=5&limit=100"
-        r = requests.get(url, timeout=10)
-        data = r.json()
-
-        if "result" not in data:
-            return None
+        data = requests.get(url).json()
 
         candles = data["result"]["list"]
 
@@ -124,58 +91,63 @@ def fetch_bybit(symbol):
     except:
         return None
 
-# ===============================
-# 🆕 FETCH CRYPTO (COINGECKO FINAL BACKUP)
-# ===============================
-def fetch_coingecko():
-    try:
-        url = "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart"
-        params = {"vs_currency": "usd", "days": "1"}
-
-        r = requests.get(url, params=params, timeout=10)
-        data = r.json()
-
-        prices = data["prices"]
-
-        df = pd.DataFrame(prices, columns=["time","close"])
-
-        df["high"] = df["close"]
-        df["low"] = df["close"]
-
-        return df
-    except:
-        return None
-
-# ===============================
-# GET DATA (ULTRA SAFE)
-# ===============================
 def get_data(name, info):
     cached = get_cache(name)
 
-    for _ in range(2):
-        try:
-            if info["type"] == "crypto":
-                df = fetch_binance(info["symbol"])
+    if info["type"] == "crypto":
+        df = fetch_binance(info["symbol"]) or fetch_bybit(info["symbol"])
+    else:
+        df = fetch_twelve(info["symbol"])
 
-                if df is None:
-                    df = fetch_bybit(info["symbol"])
+    if df is not None and len(df) > 50:
+        set_cache(name, df)
+        return df
 
-                if df is None:
-                    df = fetch_coingecko()
-            else:
-                df = fetch_twelve(info["symbol"])
+    return cached
 
-            if df is not None and len(df) >= 50:
-                set_cache(name, df)
-                return df
+# ===============================
+# SMC DETECTION
+# ===============================
+def detect_fvg(df):
+    if len(df) < 3:
+        return None
 
-        except:
-            time.sleep(1)
+    c1 = df.iloc[-3]
+    c3 = df.iloc[-1]
 
-    if cached:
-        print(f"Using cache for {name}")
-        return cached
+    if c1["high"] < c3["low"]:
+        return ("BULLISH", c1["high"], c3["low"])
 
+    if c1["low"] > c3["high"]:
+        return ("BEARISH", c3["high"], c1["low"])
+
+    return None
+
+def detect_order_block(df):
+    prev = df.iloc[-2]
+
+    if prev["close"] < prev["open"]:
+        return ("BULLISH_OB", prev["low"], prev["high"])
+
+    if prev["close"] > prev["open"]:
+        return ("BEARISH_OB", prev["low"], prev["high"])
+
+    return None
+
+def detect_liquidity(df):
+    last = df.iloc[-1]
+    if last["high"] > df["high"].iloc[-5:-1].max():
+        return "BUY_SIDE"
+    if last["low"] < df["low"].iloc[-5:-1].min():
+        return "SELL_SIDE"
+    return None
+
+def detect_bos(df):
+    last = df.iloc[-1]
+    if last["close"] > df["high"].iloc[-10:-1].max():
+        return "BOS_BUY"
+    if last["close"] < df["low"].iloc[-10:-1].min():
+        return "BOS_SELL"
     return None
 
 # ===============================
@@ -187,76 +159,81 @@ def analyze(df):
     df["ema50"] = ta.trend.EMAIndicator(df["close"], window=50).ema_indicator()
 
     last = df.iloc[-1]
-
     trend = "BUY" if last["ema20"] > last["ema50"] else "SELL"
+
     return trend, last["rsi"], last["close"]
 
-def confirmation(df):
-    if len(df) < 2:
-        return None
+# ===============================
+# ENTRY REFINEMENT
+# ===============================
+def refine_entry(fvg, ob, price):
+    if fvg:
+        _, low, high = fvg
+        return (low + high) / 2
 
-    last = df.iloc[-1]
-    prev = df.iloc[-2]
+    if ob:
+        _, low, high = ob
+        return (low + high) / 2
 
-    if last["close"] > prev["high"]:
-        return "BUY"
-    elif last["close"] < prev["low"]:
-        return "SELL"
-    return None
+    return price
 
-def get_volatility(df):
-    return (df["high"] - df["low"]).rolling(10).mean().iloc[-1]
+# ===============================
+# LIMIT EXECUTION TRACKER
+# ===============================
+def track_trade(pair, action, entry, current_price):
+    if pair not in TRADES:
+        TRADES[pair] = {
+            "entry": entry,
+            "action": action,
+            "status": "PENDING"
+        }
+
+    trade = TRADES[pair]
+
+    if trade["status"] == "PENDING":
+        if action == "BUY" and current_price <= entry:
+            trade["status"] = "FILLED"
+        elif action == "SELL" and current_price >= entry:
+            trade["status"] = "FILLED"
+
+        elif abs(current_price - entry) / entry > 0.01:
+            trade["status"] = "MISSED"
+
+    return trade["status"]
 
 # ===============================
 # SIGNAL ENGINE
 # ===============================
-def generate_signal(df):
-    trend, rsi, entry = analyze(df)
-    confirm = confirmation(df)
-    volatility = get_volatility(df)
+def generate_signal(df, pair):
+    trend, rsi, price = analyze(df)
 
-    # 🎯 SNIPER
-    if volatility > df["close"].mean() * 0.002:
-        if confirm == trend and 45 < rsi < 65:
+    fvg = detect_fvg(df)
+    ob = detect_order_block(df)
+    liquidity = detect_liquidity(df)
+    bos = detect_bos(df)
+
+    entry = refine_entry(fvg, ob, price)
+
+    if all([fvg, ob, liquidity, bos]):
+        if trend == "BUY" and liquidity == "SELL_SIDE":
+            status = track_trade(pair, "BUY", entry, price)
             return {
-                "action": trend,
+                "action": "BUY",
                 "entry": round(entry,4),
-                "sl": round(entry*0.995,4),
-                "tp": round(entry*1.03 if trend=="BUY" else entry*0.97,4),
-                "confidence": "90%",
-                "strength": "SNIPER 🎯",
-                "reason": f"High volatility | RSI={round(rsi,1)}"
+                "status": status,
+                "strength": "SNIPER 🎯"
             }
 
-    # 🔄 MEDIUM
-    if confirm == trend:
-        return {
-            "action": trend,
-            "entry": round(entry,4),
-            "sl": round(entry*0.997,4),
-            "tp": round(entry*1.02 if trend=="BUY" else entry*0.98,4),
-            "confidence": "75%",
-            "strength": "MEDIUM 🔄",
-            "reason": f"Trend + Confirm | RSI={round(rsi,1)}"
-        }
+        if trend == "SELL" and liquidity == "BUY_SIDE":
+            status = track_trade(pair, "SELL", entry, price)
+            return {
+                "action": "SELL",
+                "entry": round(entry,4),
+                "status": status,
+                "strength": "SNIPER 🎯"
+            }
 
-    # ⚡ SCALP
-    if trend == "BUY" and rsi < 65:
-        signal = "BUY"
-    elif trend == "SELL" and rsi > 35:
-        signal = "SELL"
-    else:
-        return {"message": "Waiting for setup"}
-
-    return {
-        "action": signal,
-        "entry": round(entry,4),
-        "sl": round(entry*0.998,4),
-        "tp": round(entry*1.01 if signal=="BUY" else entry*0.99,4),
-        "confidence": "60%",
-        "strength": "SCALP ⚡",
-        "reason": f"Fallback scalp | RSI={round(rsi,1)}"
-    }
+    return {"message": "Waiting for setup"}
 
 # ===============================
 # API
@@ -266,25 +243,15 @@ def signals():
     results = []
 
     for name, info in PAIRS.items():
-        try:
-            df = get_data(name, info)
+        df = get_data(name, info)
 
-            if df is None:
-                results.append({
-                    "pair": name,
-                    "message": "Data unavailable (safe mode)"
-                })
-                continue
+        if df is None:
+            results.append({"pair": name, "message": "No data"})
+            continue
 
-            signal = generate_signal(df)
-            signal["pair"] = name
-            results.append(signal)
-
-        except Exception as e:
-            results.append({
-                "pair": name,
-                "error": str(e)
-            })
+        signal = generate_signal(df, name)
+        signal["pair"] = name
+        results.append(signal)
 
     return jsonify(results)
 
@@ -295,8 +262,8 @@ def signals():
 def dashboard():
     return render_template_string("""
     <html>
-    <body style="background:#0f172a;color:white;text-align:center;font-family:sans-serif;">
-    <h2>🚀 Ultimate TradeFusion</h2>
+    <body style="background:#0f172a;color:white;text-align:center;">
+    <h2>🚀 LIMIT EXECUTION BOT</h2>
     <div id="data"></div>
 
     <script>
@@ -306,7 +273,7 @@ def dashboard():
 
         let html = "";
         data.forEach(d=>{
-            html += `<p><b>${d.pair}</b>: ${d.action || d.message || d.error} (${d.strength || ""})</p>`;
+            html += `<p><b>${d.pair}</b>: ${d.action || d.message} | ${d.status || ""}</p>`;
         });
 
         document.getElementById("data").innerHTML = html;
