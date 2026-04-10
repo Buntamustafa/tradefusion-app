@@ -1,13 +1,12 @@
 from flask import Flask, jsonify, render_template_string
 from flask_cors import CORS
-import requests, pandas as pd, ta, os, time, sqlite3
+import requests, pandas as pd, ta, os
+from datetime import datetime
 
 app = Flask(__name__)
 CORS(app)
 
-# ================= CONFIG =================
 API_KEY = os.getenv("TWELVE_API_KEY")
-NEWS_API = os.getenv("NEWS_API_KEY")
 
 PAIRS = {
     "EUR/USD": {"type": "forex", "symbol": "EUR/USD"},
@@ -15,43 +14,28 @@ PAIRS = {
     "XAU/USD": {"type": "forex", "symbol": "XAU/USD"}
 }
 
-# ================= DATABASE =================
-conn = sqlite3.connect("trades.db", check_same_thread=False)
-c = conn.cursor()
-c.execute("""
-CREATE TABLE IF NOT EXISTS trades (
-pair TEXT, action TEXT, entry REAL,
-result TEXT, confidence TEXT, type TEXT
-)
-""")
-conn.commit()
-
-# ================= SAFE REQUEST =================
-def safe_request(url, params=None):
-    for _ in range(3):
-        try:
-            r = requests.get(url, params=params, timeout=10)
-            return r.json()
-        except:
-            time.sleep(1)
-    return None
-
 # ================= DATA =================
-def fetch_binance(symbol, interval):
-    url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit=150"
-    data = safe_request(url)
-    if not data:
+def safe_request(url, params=None):
+    try:
+        return requests.get(url, params=params, timeout=5).json()
+    except:
         return None
 
-    df = pd.DataFrame(data)
-    df.columns = ["time","open","high","low","close","volume","ct","qv","trades","tb","tq","ig"]
+def fetch_binance(symbol, interval):
+    data = safe_request(f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit=100")
+    if not data: return None
 
-    for col in ["open","high","low","close"]:
+    df = pd.DataFrame(data)
+    df.columns = ["t","o","h","l","c","v","ct","qv","n","tb","tq","ig"]
+
+    for col in ["o","h","l","c"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    return df.dropna()
+    return df.rename(columns={"o":"open","h":"high","l":"low","c":"close"}).dropna()
 
 def fetch_twelve(symbol, interval):
+    if not API_KEY: return None
+
     data = safe_request(
         "https://api.twelvedata.com/time_series",
         {"symbol": symbol, "interval": interval, "apikey": API_KEY}
@@ -68,208 +52,218 @@ def fetch_twelve(symbol, interval):
     return df.dropna()
 
 def get_data(info, interval):
-    if info["type"] == "crypto":
-        return fetch_binance(info["symbol"], interval)
-    return fetch_twelve(info["symbol"], interval)
+    return fetch_binance(info["symbol"], interval) if info["type"]=="crypto" else fetch_twelve(info["symbol"], interval)
 
 # ================= INDICATORS =================
 def add_indicators(df):
     df["ema20"] = ta.trend.EMAIndicator(df["close"], 20).ema_indicator()
     df["ema50"] = ta.trend.EMAIndicator(df["close"], 50).ema_indicator()
     df["rsi"] = ta.momentum.RSIIndicator(df["close"]).rsi()
+    df["range"] = df["high"] - df["low"]
     return df.dropna()
 
+# ================= SESSION =================
+def session_filter():
+    now = datetime.utcnow().hour
+
+    if 7 <= now <= 10:
+        return "LONDON"
+    if 13 <= now <= 16:
+        return "NEW_YORK"
+    if 0 <= now <= 5:
+        return "ASIA"
+
+    return "OFF_SESSION"
+
+# ================= NEWS =================
+def detect_news_volatility(df):
+    avg = df["range"].rolling(20).mean()
+    if df["range"].iloc[-1] > avg.iloc[-2] * 2.5:
+        return True
+    return False
+
+def spread_filter(df):
+    spread = df.iloc[-1].high - df.iloc[-1].low
+    if spread > df.iloc[-1].close * 0.002:
+        return False
+    return True
+
 # ================= SMART MONEY =================
-def bos(df): return df["high"].iloc[-1] > df["high"].iloc[-3]
-def liquidity(df): return df["low"].iloc[-1] < df["low"].iloc[-3]
-def fvg(df): return df["low"].iloc[-2] > df["high"].iloc[-4]
-def ob(df): return df["close"].iloc[-2] < df["open"].iloc[-2]
-
-# ================= NEWS (PRIMARY + BACKUP) =================
-def detect_specific_news():
-    keywords = ["CPI", "NFP", "FOMC", "Interest Rate"]
-
-    # PRIMARY (FMP)
-    if NEWS_API:
-        data = safe_request(
-            f"https://financialmodelingprep.com/api/v3/economic_calendar?apikey={NEWS_API}"
-        )
-        if data:
-            for event in data[:15]:
-                name = event.get("event", "")
-                impact = event.get("impact", "")
-                if impact == "High":
-                    for k in keywords:
-                        if k in name:
-                            return k
-
-    # BACKUP (safe mode)
-    try:
-        backup = safe_request("https://api.sampleapis.com/fakebank/accounts")
-        if backup:
-            return None
-    except:
-        pass
-
+def liquidity_sweep(df):
+    last = df.iloc[-1]
+    if last.high > df["high"].iloc[-3]:
+        return "BUY_LIQUIDITY"
+    if last.low < df["low"].iloc[-3]:
+        return "SELL_LIQUIDITY"
     return None
 
-# ================= HELPERS =================
-def is_usd_pair(pair):
-    return "USD" in pair
-
-def spread_ok(df):
+def fake_breakout(df):
     last = df.iloc[-1]
-    spread = abs(last.high - last.low)
-    avg = (df["high"] - df["low"]).rolling(20).mean().iloc[-1]
-    return spread < avg * 1.8
+    if last.high > df["high"].iloc[-3] and last.close < last.open:
+        return "BULL_TRAP"
+    if last.low < df["low"].iloc[-3] and last.close > last.open:
+        return "BEAR_TRAP"
+    return None
 
-def high_volatility(df):
-    c = df.iloc[-1]
-    p = df.iloc[-2]
-    return abs(c.close - c.open) > abs(p.close - p.open) * 2
+def order_block(df):
+    prev = df.iloc[-2]
+    if prev.close > prev.open:
+        return "BEARISH_OB"
+    if prev.close < prev.open:
+        return "BULLISH_OB"
+    return None
 
-def liquidity_sweep_news(df):
-    return df["high"].iloc[-1] > df["high"].iloc[-3] or df["low"].iloc[-1] < df["low"].iloc[-3]
+def fvg(df):
+    if df["low"].iloc[-2] > df["high"].iloc[-4]:
+        return "BULLISH_FVG"
+    if df["high"].iloc[-2] < df["low"].iloc[-4]:
+        return "BEARISH_FVG"
+    return None
 
-# ================= CANDLE =================
-def bullish_engulfing(df):
-    l, p = df.iloc[-1], df.iloc[-2]
-    return l.close > l.open and p.close < p.open and l.close > p.open
+# ================= ENTRY =================
+def entry_confirmation(df, direction):
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
 
-def bearish_engulfing(df):
-    l, p = df.iloc[-1], df.iloc[-2]
-    return l.close < l.open and p.close > p.open and l.close < p.open
+    body = abs(last.close - last.open)
 
-def rejection_wick(df):
-    l = df.iloc[-1]
-    body = abs(l.close - l.open)
-    wick = (l.high - l.low) - body
-    return wick > body * 2
+    bullish_engulf = last.close > last.open and last.close > prev.high and last.open < prev.low
+    bearish_engulf = last.close < last.open and last.open > prev.high and last.close < prev.low
+
+    lower_wick = min(last.open, last.close) - last.low
+    upper_wick = last.high - max(last.open, last.close)
+
+    bullish_reject = lower_wick > body * 2
+    bearish_reject = upper_wick > body * 2
+
+    if direction == "BUY":
+        return bullish_engulf or bullish_reject
+    if direction == "SELL":
+        return bearish_engulf or bearish_reject
+
+    return False
 
 # ================= SIGNAL =================
 def generate_signal(pair, info):
+    try:
+        df5 = get_data(info, "5min")
+        df15 = get_data(info, "15min")
+        df1h = get_data(info, "1h")
 
-    if not is_usd_pair(pair):
-        return {"pair": pair, "message": "Not USD pair"}
+        if df5 is None or df15 is None or df1h is None:
+            return {"pair": pair, "message": "No data"}
 
-    df5 = get_data(info, "5min")
-    df15 = get_data(info, "15min")
-    df1h = get_data(info, "1h")
+        df5 = add_indicators(df5)
+        df15 = add_indicators(df15)
+        df1h = add_indicators(df1h)
 
-    if df5 is None or df15 is None or df1h is None:
-        return {"pair": pair, "message": "No data"}
+        if df5.empty or df15.empty or df1h.empty:
+            return {"pair": pair, "message": "Indicator error"}
 
-    df5 = add_indicators(df5)
-    df15 = add_indicators(df15)
-    df1h = add_indicators(df1h)
+        session = session_filter()
+        news = detect_news_volatility(df5)
+        spread_ok = spread_filter(df5)
 
-    bias = "BUY" if df1h.iloc[-1].ema20 > df1h.iloc[-1].ema50 else "SELL"
-    confirm = "BUY" if df15.iloc[-1].ema20 > df15.iloc[-1].ema50 else "SELL"
+        if not spread_ok:
+            return {"pair": pair, "message": "High spread (news)"}
 
-    if bias != confirm:
-        return {"pair": pair, "message": "MTF conflict"}
+        bias = "BUY" if df1h.iloc[-1].ema20 > df1h.iloc[-1].ema50 else "SELL"
+        confirm = "BUY" if df15.iloc[-1].ema20 > df15.iloc[-1].ema50 else "SELL"
 
-    last = df5.iloc[-1]
-    trend = "BUY" if last.ema20 > last.ema50 else "SELL"
-    price = last.close
-    rsi = last.rsi
+        if bias != confirm:
+            return {"pair": pair, "message": "MTF conflict"}
 
-    if not spread_ok(df5):
-        return {"pair": pair, "message": "Spread too wide"}
+        liquidity = liquidity_sweep(df5)
+        trap = fake_breakout(df5)
+        ob = order_block(df5)
+        gap = fvg(df5)
 
-    news = detect_specific_news()
+        price = df5.iloc[-1].close
 
-    bullish = bullish_engulfing(df5) or rejection_wick(df5)
-    bearish = bearish_engulfing(df5) or rejection_wick(df5)
-    candle_ok = (trend == "BUY" and bullish) or (trend == "SELL" and bearish)
+        # ================= SESSION SWITCH =================
 
-    if news:
-        if not high_volatility(df5):
-            return {"pair": pair, "message": f"{news} forming..."}
+        # 🔥 SNIPER (London/NY)
+        if session in ["LONDON", "NEW_YORK"]:
+            if trap and liquidity and ob and gap:
 
-        if liquidity_sweep_news(df5) and bos(df5) and candle_ok:
-            return {
-                "pair": pair,
-                "action": trend,
-                "entry": round(price, 4),
-                "confidence": "97%",
-                "strength": f"{news} SNIPER 🚀"
-            }
+                if trap == "BULL_TRAP" and ob == "BEARISH_OB" and gap == "BEARISH_FVG":
+                    if entry_confirmation(df5, "SELL"):
+                        return {
+                            "pair": pair,
+                            "action": "SELL",
+                            "entry": round(price,4),
+                            "confidence": "99%",
+                            "strength": f"SNIPER 🎯 ({session})",
+                            "reason": "Full confluence + confirmation"
+                        }
 
-        return {"pair": pair, "message": f"Waiting {news} confirmation"}
+                if trap == "BEAR_TRAP" and ob == "BULLISH_OB" and gap == "BULLISH_FVG":
+                    if entry_confirmation(df5, "BUY"):
+                        return {
+                            "pair": pair,
+                            "action": "BUY",
+                            "entry": round(price,4),
+                            "confidence": "99%",
+                            "strength": f"SNIPER 🎯 ({session})",
+                            "reason": "Full confluence + confirmation"
+                        }
 
-    score = sum([bos(df5), liquidity(df5), fvg(df5), ob(df5), candle_ok])
+        # 💤 SCALP (Asia)
+        if session == "ASIA":
+            rsi = df5.iloc[-1].rsi
 
-    if score >= 4 and 45 < rsi < 65:
-        strength = "SNIPER 🎯"
-        confidence = "92%"
-    elif score >= 3:
-        strength = "MEDIUM 🔄"
-        confidence = "78%"
-    else:
-        strength = "SCALP ⚡"
-        confidence = "60%"
+            if rsi < 30 and entry_confirmation(df5, "BUY"):
+                return {
+                    "pair": pair,
+                    "action": "BUY",
+                    "entry": round(price,4),
+                    "confidence": "65%",
+                    "strength": "SCALP ⚡ (ASIA)",
+                    "reason": "RSI oversold + confirmation"
+                }
 
-    c.execute("INSERT INTO trades VALUES (?,?,?,?,?,?)",
-              (pair, trend, price, "pending", confidence, strength))
-    conn.commit()
+            if rsi > 70 and entry_confirmation(df5, "SELL"):
+                return {
+                    "pair": pair,
+                    "action": "SELL",
+                    "entry": round(price,4),
+                    "confidence": "65%",
+                    "strength": "SCALP ⚡ (ASIA)",
+                    "reason": "RSI overbought + confirmation"
+                }
 
-    return {
-        "pair": pair,
-        "action": trend,
-        "entry": round(price, 4),
-        "confidence": confidence,
-        "strength": strength
-    }
+        return {"pair": pair, "message": f"No setup ({session})"}
 
-# ================= STATS =================
-def get_stats():
-    df = pd.read_sql_query("SELECT * FROM trades", conn)
-    if df.empty:
-        return {"total": 0, "winrate": 0}
-
-    wins = len(df[df["result"] == "win"])
-    total = len(df)
-    return {"total": total, "winrate": round((wins/total)*100, 2)}
+    except Exception as e:
+        return {"pair": pair, "error": str(e)}
 
 # ================= ROUTES =================
 @app.route("/signals")
 def signals():
     return jsonify([generate_signal(p, i) for p, i in PAIRS.items()])
 
-@app.route("/stats")
-def stats():
-    return jsonify(get_stats())
-
 @app.route("/")
 def dashboard():
     return render_template_string("""
     <html>
-    <body style="background:#0f172a;color:white;text-align:center;">
-    <h2>🚀 SMART NEWS TRADER</h2>
-    <div id="signals"></div>
-    <h3 id="stats"></h3>
+    <body style="background:black;color:white;text-align:center">
+    <h2>🔥 PRO AI TRADER</h2>
+    <div id="data"></div>
 
     <script>
     async function load(){
-        let s = await fetch('/signals');
-        let data = await s.json();
+        let r = await fetch('/signals');
+        let d = await r.json();
 
         let html="";
-        data.forEach(d=>{
-            html += `<p><b>${d.pair}</b>: ${d.action||d.message} (${d.strength||""})</p>`;
+        d.forEach(x=>{
+            html += `<p><b>${x.pair}</b> → ${x.action||x.message}<br>${x.strength||""}<br>${x.reason||""}</p><hr>`;
         });
 
-        document.getElementById("signals").innerHTML = html;
-
-        let st = await fetch('/stats');
-        let stats = await st.json();
-
-        document.getElementById("stats").innerHTML =
-            `Trades: ${stats.total} | Winrate: ${stats.winrate}%`;
+        document.getElementById("data").innerHTML = html;
     }
 
-    setInterval(load, 10000);
+    setInterval(load,5000);
     load();
     </script>
     </body>
