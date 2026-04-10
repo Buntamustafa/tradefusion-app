@@ -10,19 +10,18 @@ app = Flask(__name__)
 CORS(app)
 
 # ===============================
-# CONFIG (FIXED SYMBOLS)
+# CONFIG
 # ===============================
 PAIRS = {
-    "EUR/USD": "EUR/USD",
-    "BTC/USD": "BTCUSDT",
-    "XAU/USD": "XAU/USD"
+    "EUR/USD": {"type": "forex", "symbol": "EUR/USD"},
+    "BTC/USD": {"type": "crypto", "symbol": "BTCUSDT"},
+    "XAU/USD": {"type": "forex", "symbol": "XAU/USD"}
 }
 
-TWELVE_API_KEY = os.getenv("TWELVE_API_KEY")
+API_KEY = os.getenv("TWELVE_API_KEY")
 
 CACHE = {}
 CACHE_TIME = 60
-
 
 # ===============================
 # CACHE
@@ -34,21 +33,18 @@ def get_cache(key):
             return data
     return None
 
-
 def set_cache(key, value):
     CACHE[key] = (value, time.time())
 
-
 # ===============================
-# FETCH (SAFE)
+# FETCH FUNCTIONS
 # ===============================
 def fetch_twelve(symbol):
     url = "https://api.twelvedata.com/time_series"
-
     params = {
         "symbol": symbol,
         "interval": "5min",
-        "apikey": TWELVE_API_KEY,
+        "apikey": API_KEY,
         "outputsize": 100
     }
 
@@ -61,12 +57,10 @@ def fetch_twelve(symbol):
                 time.sleep(1)
                 continue
 
-            df = pd.DataFrame(data["values"])
-            df = df.iloc[::-1]
+            df = pd.DataFrame(data["values"]).iloc[::-1]
 
-            df["close"] = df["close"].astype(float)
-            df["high"] = df["high"].astype(float)
-            df["low"] = df["low"].astype(float)
+            for col in ["close", "high", "low"]:
+                df[col] = df[col].astype(float)
 
             if len(df) < 50:
                 raise Exception("Not enough data")
@@ -78,69 +72,80 @@ def fetch_twelve(symbol):
 
     raise Exception("TwelveData failed")
 
-
-def fetch_binance(symbol):
-    url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval=5m&limit=100"
-
+def fetch_bybit(symbol):
     try:
+        url = f"https://api.bybit.com/v5/market/kline?category=linear&symbol={symbol}&interval=5&limit=100"
         r = requests.get(url, timeout=10)
         data = r.json()
 
-        if not isinstance(data, list):
-            raise Exception("Invalid Binance data")
+        candles = data["result"]["list"]
 
-        df = pd.DataFrame(data, columns=[
-            "time","open","high","low","close","volume",
-            "close_time","qav","trades","taker_base","taker_quote","ignore"
-        ])
+        df = pd.DataFrame(candles, columns=[
+            "time","open","high","low","close","volume","turnover"
+        ]).iloc[::-1]
 
-        df["close"] = df["close"].astype(float)
-        df["high"] = df["high"].astype(float)
-        df["low"] = df["low"].astype(float)
-
-        if len(df) < 50:
-            raise Exception("Not enough Binance data")
+        for col in ["open","close","high","low"]:
+            df[col] = df[col].astype(float)
 
         return df
-
     except:
-        raise Exception("Binance failed")
+        return None
 
+def fetch_binance(symbol):
+    urls = [
+        f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval=5m&limit=100",
+        f"https://api.binance.com/api/v3/uiKlines?symbol={symbol}&interval=5m&limit=100"
+    ]
 
-def get_data(name, symbol):
+    for url in urls:
+        for _ in range(2):
+            try:
+                r = requests.get(url, timeout=10)
+                data = r.json()
+
+                if isinstance(data, list) and len(data) > 50:
+                    df = pd.DataFrame(data, columns=[
+                        "time","open","high","low","close","volume",
+                        "close_time","qav","trades","taker_base","taker_quote","ignore"
+                    ])
+
+                    for col in ["open","close","high","low"]:
+                        df[col] = df[col].astype(float)
+
+                    return df
+            except:
+                time.sleep(1)
+
+    return fetch_bybit(symbol)
+
+def get_data(name, info):
     cached = get_cache(name)
     if cached:
         return cached
 
-    try:
-        if "BTC" in name:
-            df = fetch_binance(symbol)
-        else:
-            df = fetch_twelve(symbol)
+    if info["type"] == "crypto":
+        df = fetch_binance(info["symbol"])
+    else:
+        df = fetch_twelve(info["symbol"])
 
-        set_cache(name, df)
-        return df
+    if df is None or len(df) < 50:
+        raise Exception("Data fetch failed")
 
-    except Exception as e:
-        raise Exception(str(e))
-
+    set_cache(name, df)
+    return df
 
 # ===============================
-# ANALYSIS (SAFE)
+# ANALYSIS
 # ===============================
 def analyze(df):
-    if df is None or len(df) < 2:
-        raise Exception("Invalid data")
-
     df["rsi"] = ta.momentum.RSIIndicator(df["close"]).rsi()
-    df["ema"] = ta.trend.EMAIndicator(df["close"], window=20).ema_indicator()
+    df["ema20"] = ta.trend.EMAIndicator(df["close"], window=20).ema_indicator()
+    df["ema50"] = ta.trend.EMAIndicator(df["close"], window=50).ema_indicator()
 
     last = df.iloc[-1]
 
-    trend = "BUY" if last["close"] > last["ema"] else "SELL"
-
+    trend = "BUY" if last["ema20"] > last["ema50"] else "SELL"
     return trend, last["rsi"], last["close"]
-
 
 def confirmation(df):
     if len(df) < 2:
@@ -155,38 +160,63 @@ def confirmation(df):
         return "SELL"
     return None
 
+# ===============================
+# VOLATILITY DETECTION
+# ===============================
+def get_volatility(df):
+    return (df["high"] - df["low"]).rolling(10).mean().iloc[-1]
 
 # ===============================
-# SIGNAL
+# SIGNAL ENGINE (AUTO SWITCH)
 # ===============================
 def generate_signal(df):
     trend, rsi, entry = analyze(df)
     confirm = confirmation(df)
+    volatility = get_volatility(df)
 
-    if trend == "BUY" and confirm == "BUY" and rsi < 60:
+    # 🎯 SNIPER (HIGH VOLATILITY)
+    if volatility > df["close"].mean() * 0.002:
+        if confirm == trend and 45 < rsi < 65:
+            signal = trend
+            return {
+                "action": signal,
+                "entry": round(entry,4),
+                "sl": round(entry*0.995,4),
+                "tp": round(entry*1.03 if signal=="BUY" else entry*0.97,4),
+                "confidence": "90%",
+                "strength": "SNIPER 🎯",
+                "reason": f"High volatility | RSI={round(rsi,1)}"
+            }
+
+    # 🔄 MEDIUM
+    if confirm == trend:
+        return {
+            "action": trend,
+            "entry": round(entry,4),
+            "sl": round(entry*0.997,4),
+            "tp": round(entry*1.02 if trend=="BUY" else entry*0.98,4),
+            "confidence": "75%",
+            "strength": "MEDIUM 🔄",
+            "reason": f"Trend + Confirm | RSI={round(rsi,1)}"
+        }
+
+    # ⚡ SCALP
+    if trend == "BUY" and rsi < 65:
         signal = "BUY"
-    elif trend == "SELL" and confirm == "SELL" and rsi > 40:
+    elif trend == "SELL" and rsi > 35:
         signal = "SELL"
     else:
         return {"message": "Waiting for setup"}
 
-    if signal == "BUY":
-        sl = entry * 0.998
-        tp = entry * 1.01
-    else:
-        sl = entry * 1.002
-        tp = entry * 0.99
-
     return {
         "action": signal,
-        "entry": round(entry, 4),
-        "sl": round(sl, 4),
-        "tp": round(tp, 4),
+        "entry": round(entry,4),
+        "sl": round(entry*0.998,4),
+        "tp": round(entry*1.01 if signal=="BUY" else entry*0.99,4),
         "confidence": "60%",
         "strength": "SCALP ⚡",
-        "reason": f"{signal} | RSI={round(rsi,1)}"
+        "reason": f"Fallback scalp | RSI={round(rsi,1)}"
     }
-
 
 # ===============================
 # API
@@ -195,20 +225,16 @@ def generate_signal(df):
 def signals():
     results = []
 
-    for name, symbol in PAIRS.items():
+    for name, info in PAIRS.items():
         try:
-            df = get_data(name, symbol)
+            df = get_data(name, info)
             signal = generate_signal(df)
             signal["pair"] = name
             results.append(signal)
         except Exception as e:
-            results.append({
-                "pair": name,
-                "error": str(e)
-            })
+            results.append({"pair": name, "error": str(e)})
 
     return jsonify(results)
-
 
 # ===============================
 # DASHBOARD
@@ -217,8 +243,8 @@ def signals():
 def dashboard():
     return render_template_string("""
     <html>
-    <body style="background:black;color:white;text-align:center;font-family:sans-serif;">
-    <h2>TradeFusion Live</h2>
+    <body style="background:#0f172a;color:white;text-align:center;font-family:sans-serif;">
+    <h2>🚀 Smart TradeFusion Dashboard</h2>
     <div id="data"></div>
 
     <script>
@@ -228,7 +254,7 @@ def dashboard():
 
         let html = "";
         data.forEach(d=>{
-            html += `<p>${d.pair}: ${d.action || d.message || d.error}</p>`;
+            html += `<p><b>${d.pair}</b>: ${d.action || d.message || d.error} (${d.strength || ""})</p>`;
         });
 
         document.getElementById("data").innerHTML = html;
@@ -240,7 +266,6 @@ def dashboard():
     </body>
     </html>
     """)
-
 
 # ===============================
 # RUN
