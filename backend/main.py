@@ -9,13 +9,16 @@ CHAT_ID = "YOUR_CHAT_ID"
 
 signals = []
 
-# 🔔 Telegram
+# 👥 MULTI PAIRS
+PAIRS = ["BTCUSDT", "ETHUSDT"]
+
+# 🔔 TELEGRAM
 def send_telegram(msg):
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
     requests.post(url, data={"chat_id": CHAT_ID, "text": msg})
 
-# 📊 Get data
-def get_data(symbol="BTCUSDT", interval="15m"):
+# 📊 DATA
+def get_data(symbol, interval="15m"):
     url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit=100"
     data = requests.get(url).json()
     df = pd.DataFrame(data)
@@ -26,14 +29,6 @@ def get_data(symbol="BTCUSDT", interval="15m"):
     df["o"] = df["o"].astype(float)
     return df
 
-# 🔥 BOS
-def detect_bos(df):
-    return df["c"].iloc[-1] > df["h"].iloc[-5]
-
-# ⚡ FVG
-def detect_fvg(df):
-    return df["l"].iloc[-2] > df["h"].iloc[-4]
-
 # 📈 RSI
 def rsi(df, period=14):
     delta = df["c"].diff()
@@ -42,99 +37,101 @@ def rsi(df, period=14):
     rs = gain / loss
     return 100 - (100 / (1 + rs))
 
-# 💧 Liquidity Sweep
+# 💧 LIQUIDITY SWEEP
 def liquidity_sweep(df):
     prev_high = df["h"].iloc[-5:-1].max()
     prev_low = df["l"].iloc[-5:-1].min()
 
-    current_high = df["h"].iloc[-1]
-    current_low = df["l"].iloc[-1]
-    close = df["c"].iloc[-1]
-
-    if current_high > prev_high and close < prev_high:
+    if df["h"].iloc[-1] > prev_high and df["c"].iloc[-1] < prev_high:
         return "SELL"
-    if current_low < prev_low and close > prev_low:
+    if df["l"].iloc[-1] < prev_low and df["c"].iloc[-1] > prev_low:
         return "BUY"
     return None
 
-# 🧠 ORDER BLOCK DETECTION
+# 🧠 ORDER BLOCK
 def order_block(df):
-    # Last bearish candle before strong move up → bullish OB
     if df["c"].iloc[-3] < df["o"].iloc[-3] and df["c"].iloc[-1] > df["h"].iloc[-3]:
         return "BUY"
-
-    # Last bullish candle before strong move down → bearish OB
     if df["c"].iloc[-3] > df["o"].iloc[-3] and df["c"].iloc[-1] < df["l"].iloc[-3]:
         return "SELL"
-
     return None
 
-# 📍 SIMPLE LIQUIDITY ZONE
+# 📍 ZONE
 def liquidity_zone(df):
-    high_zone = df["h"].rolling(10).max().iloc[-1]
-    low_zone = df["l"].rolling(10).min().iloc[-1]
+    high = df["h"].rolling(10).max().iloc[-1]
+    low = df["l"].rolling(10).min().iloc[-1]
     price = df["c"].iloc[-1]
 
-    if price >= high_zone * 0.995:
+    if price >= high * 0.995:
         return "HIGH_ZONE"
-    elif price <= low_zone * 1.005:
+    if price <= low * 1.005:
         return "LOW_ZONE"
     return "MID"
 
-# 📰 News filter
-def news_filter(df):
-    return abs(df["c"].iloc[-1] - df["c"].iloc[-2]) > 50
-
 # 🧠 SIGNAL LOGIC
-def generate_signal():
-    df_15m = get_data(interval="15m")
-    df_1h = get_data(interval="1h")
+def generate_signal(pair):
+    df_15m = get_data(pair, "15m")
+    df_1h = get_data(pair, "1h")
 
     trend_up = df_1h["c"].iloc[-1] > df_1h["c"].iloc[-10]
 
-    bos = detect_bos(df_15m)
-    fvg = detect_fvg(df_15m)
-    rsi_val = rsi(df_15m).iloc[-1]
     sweep = liquidity_sweep(df_15m)
     ob = order_block(df_15m)
     zone = liquidity_zone(df_15m)
-    news = news_filter(df_15m)
+    rsi_val = rsi(df_15m).iloc[-1]
 
     signal_type = None
     strength = "SCALP"
 
-    # 🔥 ELITE LOGIC
-    if trend_up and sweep == "BUY" and ob == "BUY" and zone == "LOW_ZONE" and rsi_val < 40:
+    # 🟣 ELITE
+    if trend_up and sweep == "BUY" and ob == "BUY" and zone == "LOW_ZONE" and rsi_val < 35:
         signal_type = "BUY"
-        strength = "STRONG"
+        strength = "ELITE"
 
-    elif not trend_up and sweep == "SELL" and ob == "SELL" and zone == "HIGH_ZONE" and rsi_val > 60:
+    elif not trend_up and sweep == "SELL" and ob == "SELL" and zone == "HIGH_ZONE" and rsi_val > 65:
         signal_type = "SELL"
+        strength = "ELITE"
+
+    # 🔥 STRONG
+    elif sweep == ob and sweep is not None:
+        signal_type = sweep
         strength = "STRONG"
 
-    elif sweep == ob:
+    # ⚡ MEDIUM
+    elif sweep:
         signal_type = sweep
         strength = "MEDIUM"
 
-    # ⚠️ News adjustment
-    if news:
-        strength = "SCALP"
-
     if signal_type:
+        price = df_15m["c"].iloc[-1]
+
+        if signal_type == "BUY":
+            entry = round(price, 2)
+            sl = round(price - 100, 2)
+            tp = round(price + 200, 2)
+        else:
+            entry = round(price, 2)
+            sl = round(price + 100, 2)
+            tp = round(price - 200, 2)
+
         signal = {
-            "pair": "BTCUSDT",
+            "pair": pair,
             "type": signal_type,
             "strength": strength,
+            "entry": entry,
+            "sl": sl,
+            "tp": tp,
             "time": time.strftime("%H:%M:%S")
         }
 
         signals.insert(0, signal)
 
         msg = f"""
-📊 BTCUSDT {signal_type}
+📊 {pair} {signal_type}
 🔥 {strength}
-🧠 OB + Liquidity + BOS + FVG
-📍 Zone: {zone}
+💰 Entry: {entry}
+🛑 SL: {sl}
+🎯 TP: {tp}
 ⏰ {signal['time']}
 """
         send_telegram(msg)
@@ -143,7 +140,8 @@ def generate_signal():
 def bot_loop():
     while True:
         try:
-            generate_signal()
+            for pair in PAIRS:
+                generate_signal(pair)
         except Exception as e:
             print(e)
         time.sleep(60)
@@ -153,25 +151,59 @@ def bot_loop():
 def dashboard():
     return render_template_string("""
     <html>
-    <body style="background:#0b1a2f;color:white;font-family:sans-serif;">
-    <h2>📊 TradeFusion ELITE Signals</h2>
+    <head>
+        <meta http-equiv="refresh" content="10">
+    </head>
+
+    <body style="background:#0b1a2f;color:white;font-family:sans-serif;padding:15px;">
+
+    <h2>📊 TradeFusion PRO Signals</h2>
+
+    {% if signals|length == 0 %}
+        <div style="background:#132a4a;padding:20px;border-radius:10px;">
+            ⚠️ No signals yet...
+        </div>
+    {% endif %}
 
     {% for s in signals %}
-    <div style="background:#132a4a;padding:15px;margin:10px;border-radius:10px;">
-        <b>{{s.pair}}</b> - {{s.type}}<br>
-        <b>{{s.strength}}</b><br>
-        ⏰ {{s.time}}
+    <div style="background:#132a4a;padding:15px;margin:10px 0;border-radius:12px;">
+
+        <b>{{s.pair}}</b> | {{s.type}} | ⏰ {{s.time}}<br><br>
+
+        {% if s.strength == "ELITE" %}
+            <span style="background:purple;padding:5px 10px;border-radius:8px;">🟣 ELITE</span>
+        {% elif s.strength == "STRONG" %}
+            <span style="background:red;padding:5px 10px;border-radius:8px;">🔥 STRONG</span>
+        {% elif s.strength == "MEDIUM" %}
+            <span style="background:orange;padding:5px 10px;border-radius:8px;">⚡ MEDIUM</span>
+        {% else %}
+            <span style="background:gray;padding:5px 10px;border-radius:8px;">⚠️ SCALP</span>
+        {% endif %}
+
+        <br><br>
+
+        💰 Entry: {{s.entry}}<br>
+        🛑 SL: {{s.sl}}<br>
+        🎯 TP: {{s.tp}}
+
     </div>
+
+    <!-- 🔊 SOUND ALERT -->
+    <audio autoplay>
+        <source src="https://www.soundjay.com/buttons/sounds/button-3.mp3" type="audio/mpeg">
+    </audio>
+
     {% endfor %}
+
     </body>
     </html>
     """, signals=signals)
 
 @app.route("/")
 def home():
-    print("Ping received")
     return "Bot running ✅"
 
+# 🚀 START
 threading.Thread(target=bot_loop).start()
 
 if __name__ == "__main__":
