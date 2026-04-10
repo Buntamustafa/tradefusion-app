@@ -10,27 +10,27 @@ app = Flask(__name__)
 CORS(app)
 
 # ===============================
-# CONFIG
+# CONFIG (FIXED SYMBOLS)
 # ===============================
 PAIRS = {
-    "EUR/USD": "EURUSD",
+    "EUR/USD": "EUR/USD",
     "BTC/USD": "BTCUSDT",
-    "XAU/USD": "XAUUSD"
+    "XAU/USD": "XAU/USD"
 }
 
 TWELVE_API_KEY = os.getenv("TWELVE_API_KEY")
 
-# ===============================
-# CACHE
-# ===============================
 CACHE = {}
 CACHE_TIME = 60
 
 
-def get_cached(key):
+# ===============================
+# CACHE
+# ===============================
+def get_cache(key):
     if key in CACHE:
-        data, timestamp = CACHE[key]
-        if time.time() - timestamp < CACHE_TIME:
+        data, t = CACHE[key]
+        if time.time() - t < CACHE_TIME:
             return data
     return None
 
@@ -40,71 +40,98 @@ def set_cache(key, value):
 
 
 # ===============================
-# FETCH DATA
+# FETCH (SAFE)
 # ===============================
-def fetch_twelve(symbol, interval="5min"):
+def fetch_twelve(symbol):
     url = "https://api.twelvedata.com/time_series"
+
     params = {
         "symbol": symbol,
-        "interval": interval,
+        "interval": "5min",
         "apikey": TWELVE_API_KEY,
         "outputsize": 100
     }
 
-    r = requests.get(url, params=params)
-    data = r.json()
+    for _ in range(3):
+        try:
+            r = requests.get(url, params=params, timeout=10)
+            data = r.json()
 
-    if "values" not in data:
-        raise Exception("TwelveData error")
+            if "values" not in data:
+                time.sleep(1)
+                continue
 
-    df = pd.DataFrame(data["values"])
-    df = df.iloc[::-1]
+            df = pd.DataFrame(data["values"])
+            df = df.iloc[::-1]
 
-    df["close"] = df["close"].astype(float)
-    df["high"] = df["high"].astype(float)
-    df["low"] = df["low"].astype(float)
+            df["close"] = df["close"].astype(float)
+            df["high"] = df["high"].astype(float)
+            df["low"] = df["low"].astype(float)
 
-    if len(df) < 50:
-        raise Exception("Not enough data")
+            if len(df) < 50:
+                raise Exception("Not enough data")
 
-    return df
+            return df
+
+        except:
+            time.sleep(1)
+
+    raise Exception("TwelveData failed")
 
 
 def fetch_binance(symbol):
     url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval=5m&limit=100"
-    r = requests.get(url)
-    data = r.json()
 
-    df = pd.DataFrame(data, columns=[
-        "time","open","high","low","close","volume",
-        "close_time","qav","trades","taker_base","taker_quote","ignore"
-    ])
+    try:
+        r = requests.get(url, timeout=10)
+        data = r.json()
 
-    df["close"] = df["close"].astype(float)
-    df["high"] = df["high"].astype(float)
-    df["low"] = df["low"].astype(float)
+        if not isinstance(data, list):
+            raise Exception("Invalid Binance data")
 
-    return df
+        df = pd.DataFrame(data, columns=[
+            "time","open","high","low","close","volume",
+            "close_time","qav","trades","taker_base","taker_quote","ignore"
+        ])
+
+        df["close"] = df["close"].astype(float)
+        df["high"] = df["high"].astype(float)
+        df["low"] = df["low"].astype(float)
+
+        if len(df) < 50:
+            raise Exception("Not enough Binance data")
+
+        return df
+
+    except:
+        raise Exception("Binance failed")
 
 
 def get_data(name, symbol):
-    cached = get_cached(name)
+    cached = get_cache(name)
     if cached:
         return cached
 
-    if "BTC" in name:
-        df = fetch_binance(symbol)
-    else:
-        df = fetch_twelve(symbol)
+    try:
+        if "BTC" in name:
+            df = fetch_binance(symbol)
+        else:
+            df = fetch_twelve(symbol)
 
-    set_cache(name, df)
-    return df
+        set_cache(name, df)
+        return df
+
+    except Exception as e:
+        raise Exception(str(e))
 
 
 # ===============================
-# ANALYSIS
+# ANALYSIS (SAFE)
 # ===============================
 def analyze(df):
+    if df is None or len(df) < 2:
+        raise Exception("Invalid data")
+
     df["rsi"] = ta.momentum.RSIIndicator(df["close"]).rsi()
     df["ema"] = ta.trend.EMAIndicator(df["close"], window=20).ema_indicator()
 
@@ -116,6 +143,9 @@ def analyze(df):
 
 
 def confirmation(df):
+    if len(df) < 2:
+        return None
+
     last = df.iloc[-1]
     prev = df.iloc[-2]
 
@@ -138,7 +168,7 @@ def generate_signal(df):
     elif trend == "SELL" and confirm == "SELL" and rsi > 40:
         signal = "SELL"
     else:
-        return {"message": "No clean scalp"}
+        return {"message": "Waiting for setup"}
 
     if signal == "BUY":
         sl = entry * 0.998
@@ -159,7 +189,7 @@ def generate_signal(df):
 
 
 # ===============================
-# API ROUTE
+# API
 # ===============================
 @app.route('/signals')
 def signals():
@@ -172,85 +202,44 @@ def signals():
             signal["pair"] = name
             results.append(signal)
         except Exception as e:
-            results.append({"pair": name, "error": str(e)})
+            results.append({
+                "pair": name,
+                "error": str(e)
+            })
 
     return jsonify(results)
 
 
 # ===============================
-# LIVE DASHBOARD
+# DASHBOARD
 # ===============================
 @app.route('/')
 def dashboard():
     return render_template_string("""
-<!DOCTYPE html>
-<html>
-<head>
-    <title>TradeFusion Dashboard</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <style>
-        body {
-            background: #0f172a;
-            color: white;
-            font-family: Arial;
-            text-align: center;
-        }
-        h1 {
-            margin-top: 20px;
-        }
-        .card {
-            background: #1e293b;
-            margin: 15px;
-            padding: 20px;
-            border-radius: 10px;
-        }
-        .buy { color: #22c55e; }
-        .sell { color: #ef4444; }
-        .wait { color: #facc15; }
-    </style>
-</head>
-<body>
+    <html>
+    <body style="background:black;color:white;text-align:center;font-family:sans-serif;">
+    <h2>TradeFusion Live</h2>
+    <div id="data"></div>
 
-<h1>🚀 TradeFusion Live Signals</h1>
-<div id="signals"></div>
+    <script>
+    async function load(){
+        let res = await fetch('/signals');
+        let data = await res.json();
 
-<script>
-async function loadSignals() {
-    const res = await fetch('/signals');
-    const data = await res.json();
+        let html = "";
+        data.forEach(d=>{
+            html += `<p>${d.pair}: ${d.action || d.message || d.error}</p>`;
+        });
 
-    let html = "";
+        document.getElementById("data").innerHTML = html;
+    }
 
-    data.forEach(s => {
-        let color = "wait";
-        if (s.action === "BUY") color = "buy";
-        if (s.action === "SELL") color = "sell";
-
-        html += `
-        <div class="card">
-            <h2>${s.pair}</h2>
-            <p class="${color}">${s.action || s.message}</p>
-            <p>Entry: ${s.entry || "-"}</p>
-            <p>SL: ${s.sl || "-"}</p>
-            <p>TP: ${s.tp || "-"}</p>
-            <p>${s.reason || ""}</p>
-        </div>
-        `;
-    });
-
-    document.getElementById("signals").innerHTML = html;
-}
-
-// Auto refresh every 10 seconds
-setInterval(loadSignals, 10000);
-
-// Initial load
-loadSignals();
-</script>
-
-</body>
-</html>
-""")
+    setInterval(load, 10000);
+    load();
+    </script>
+    </body>
+    </html>
+    """)
 
 
 # ===============================
