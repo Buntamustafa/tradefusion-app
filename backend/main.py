@@ -5,7 +5,6 @@ import pandas as pd
 import ta
 import os
 import time
-from datetime import datetime
 
 app = Flask(__name__)
 CORS(app)
@@ -19,30 +18,36 @@ PAIRS = {
 API_KEY = os.getenv("TWELVE_API_KEY")
 
 CACHE = {}
-TRADES = {}  # store active trades
+TRADES = {}
 CACHE_TIME = 60
 
 # ===============================
-# CACHE
+# SAFE CACHE
 # ===============================
 def get_cache(key):
-    if key in CACHE:
-        data, t = CACHE[key]
-        if time.time() - t < CACHE_TIME:
-            return data
+    try:
+        if key in CACHE:
+            data, t = CACHE[key]
+            if time.time() - t < CACHE_TIME:
+                return data
+    except:
+        pass
     return None
 
 def set_cache(key, value):
-    CACHE[key] = (value, time.time())
+    try:
+        CACHE[key] = (value, time.time())
+    except:
+        pass
 
 # ===============================
-# FETCH DATA
+# SAFE FETCH
 # ===============================
 def fetch_twelve(symbol):
     try:
         url = "https://api.twelvedata.com/time_series"
         params = {"symbol": symbol,"interval": "5min","apikey": API_KEY,"outputsize": 100}
-        data = requests.get(url, params=params).json()
+        data = requests.get(url, params=params, timeout=10).json()
 
         if "values" not in data:
             return None
@@ -50,190 +55,152 @@ def fetch_twelve(symbol):
         df = pd.DataFrame(data["values"]).iloc[::-1]
 
         for col in ["open","close","high","low"]:
-            df[col] = df[col].astype(float)
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+        df = df.dropna()
+
+        if len(df) < 50:
+            return None
 
         return df
+
     except:
         return None
+
 
 def fetch_binance(symbol):
     try:
         url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval=5m&limit=100"
-        data = requests.get(url).json()
+        data = requests.get(url, timeout=10).json()
 
-        df = pd.DataFrame(data, columns=[
+        if not isinstance(data, list):
+            return None
+
+        df = pd.DataFrame(data)
+
+        if df.empty:
+            return None
+
+        df.columns = [
             "time","open","high","low","close","volume",
             "close_time","qav","trades","taker_base","taker_quote","ignore"
-        ])
+        ]
 
         for col in ["open","close","high","low"]:
-            df[col] = df[col].astype(float)
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+        df = df.dropna()
 
         return df
+
     except:
         return None
 
-def fetch_bybit(symbol):
-    try:
-        url = f"https://api.bybit.com/v5/market/kline?category=linear&symbol={symbol}&interval=5&limit=100"
-        data = requests.get(url).json()
-
-        candles = data["result"]["list"]
-
-        df = pd.DataFrame(candles, columns=[
-            "time","open","high","low","close","volume","turnover"
-        ]).iloc[::-1]
-
-        for col in ["open","close","high","low"]:
-            df[col] = df[col].astype(float)
-
-        return df
-    except:
-        return None
 
 def get_data(name, info):
-    cached = get_cache(name)
+    try:
+        cached = get_cache(name)
 
-    if info["type"] == "crypto":
-        df = fetch_binance(info["symbol"]) or fetch_bybit(info["symbol"])
-    else:
-        df = fetch_twelve(info["symbol"])
+        if info["type"] == "crypto":
+            df = fetch_binance(info["symbol"])
+        else:
+            df = fetch_twelve(info["symbol"])
 
-    if df is not None and len(df) > 50:
-        set_cache(name, df)
-        return df
+        if df is not None:
+            set_cache(name, df)
+            return df
 
-    return cached
+        return cached
 
-# ===============================
-# SMC DETECTION
-# ===============================
-def detect_fvg(df):
-    if len(df) < 3:
+    except:
         return None
 
-    c1 = df.iloc[-3]
-    c3 = df.iloc[-1]
-
-    if c1["high"] < c3["low"]:
-        return ("BULLISH", c1["high"], c3["low"])
-
-    if c1["low"] > c3["high"]:
-        return ("BEARISH", c3["high"], c1["low"])
-
-    return None
-
-def detect_order_block(df):
-    prev = df.iloc[-2]
-
-    if prev["close"] < prev["open"]:
-        return ("BULLISH_OB", prev["low"], prev["high"])
-
-    if prev["close"] > prev["open"]:
-        return ("BEARISH_OB", prev["low"], prev["high"])
-
-    return None
-
-def detect_liquidity(df):
-    last = df.iloc[-1]
-    if last["high"] > df["high"].iloc[-5:-1].max():
-        return "BUY_SIDE"
-    if last["low"] < df["low"].iloc[-5:-1].min():
-        return "SELL_SIDE"
-    return None
-
-def detect_bos(df):
-    last = df.iloc[-1]
-    if last["close"] > df["high"].iloc[-10:-1].max():
-        return "BOS_BUY"
-    if last["close"] < df["low"].iloc[-10:-1].min():
-        return "BOS_SELL"
-    return None
-
 # ===============================
-# ANALYSIS
+# SAFE ANALYSIS
 # ===============================
 def analyze(df):
-    df["rsi"] = ta.momentum.RSIIndicator(df["close"]).rsi()
-    df["ema20"] = ta.trend.EMAIndicator(df["close"], window=20).ema_indicator()
-    df["ema50"] = ta.trend.EMAIndicator(df["close"], window=50).ema_indicator()
+    try:
+        df["rsi"] = ta.momentum.RSIIndicator(df["close"]).rsi()
+        df["ema20"] = ta.trend.EMAIndicator(df["close"], window=20).ema_indicator()
+        df["ema50"] = ta.trend.EMAIndicator(df["close"], window=50).ema_indicator()
 
-    last = df.iloc[-1]
-    trend = "BUY" if last["ema20"] > last["ema50"] else "SELL"
+        df = df.dropna()
 
-    return trend, last["rsi"], last["close"]
+        if len(df) < 10:
+            return None, None, None
+
+        last = df.iloc[-1]
+
+        trend = "BUY" if last["ema20"] > last["ema50"] else "SELL"
+
+        return trend, float(last["rsi"]), float(last["close"])
+
+    except:
+        return None, None, None
 
 # ===============================
-# ENTRY REFINEMENT
+# SAFE ENTRY
 # ===============================
-def refine_entry(fvg, ob, price):
-    if fvg:
-        _, low, high = fvg
-        return (low + high) / 2
-
-    if ob:
-        _, low, high = ob
-        return (low + high) / 2
-
+def refine_entry(price):
     return price
 
 # ===============================
-# LIMIT EXECUTION TRACKER
+# SAFE TRADE TRACKER
 # ===============================
-def track_trade(pair, action, entry, current_price):
-    if pair not in TRADES:
-        TRADES[pair] = {
-            "entry": entry,
-            "action": action,
-            "status": "PENDING"
-        }
+def track_trade(pair, action, entry, price):
+    try:
+        if pair not in TRADES:
+            TRADES[pair] = {"entry": entry, "action": action, "status": "PENDING"}
 
-    trade = TRADES[pair]
+        trade = TRADES[pair]
 
-    if trade["status"] == "PENDING":
-        if action == "BUY" and current_price <= entry:
-            trade["status"] = "FILLED"
-        elif action == "SELL" and current_price >= entry:
-            trade["status"] = "FILLED"
+        if trade["status"] == "PENDING":
+            if action == "BUY" and price <= entry:
+                trade["status"] = "FILLED"
+            elif action == "SELL" and price >= entry:
+                trade["status"] = "FILLED"
+            elif abs(price - entry) / entry > 0.01:
+                trade["status"] = "MISSED"
 
-        elif abs(current_price - entry) / entry > 0.01:
-            trade["status"] = "MISSED"
+        return trade["status"]
 
-    return trade["status"]
+    except:
+        return "ERROR"
 
 # ===============================
-# SIGNAL ENGINE
+# SIGNAL ENGINE (SAFE)
 # ===============================
 def generate_signal(df, pair):
-    trend, rsi, price = analyze(df)
+    try:
+        trend, rsi, price = analyze(df)
 
-    fvg = detect_fvg(df)
-    ob = detect_order_block(df)
-    liquidity = detect_liquidity(df)
-    bos = detect_bos(df)
+        if trend is None:
+            return {"message": "No valid data"}
 
-    entry = refine_entry(fvg, ob, price)
+        entry = refine_entry(price)
 
-    if all([fvg, ob, liquidity, bos]):
-        if trend == "BUY" and liquidity == "SELL_SIDE":
+        if trend == "BUY" and rsi > 50:
             status = track_trade(pair, "BUY", entry, price)
             return {
                 "action": "BUY",
                 "entry": round(entry,4),
                 "status": status,
-                "strength": "SNIPER 🎯"
+                "confidence": "70%"
             }
 
-        if trend == "SELL" and liquidity == "BUY_SIDE":
+        if trend == "SELL" and rsi < 50:
             status = track_trade(pair, "SELL", entry, price)
             return {
                 "action": "SELL",
                 "entry": round(entry,4),
                 "status": status,
-                "strength": "SNIPER 🎯"
+                "confidence": "70%"
             }
 
-    return {"message": "Waiting for setup"}
+        return {"message": "Waiting for setup"}
+
+    except Exception as e:
+        return {"error": str(e)}
 
 # ===============================
 # API
@@ -243,15 +210,19 @@ def signals():
     results = []
 
     for name, info in PAIRS.items():
-        df = get_data(name, info)
+        try:
+            df = get_data(name, info)
 
-        if df is None:
-            results.append({"pair": name, "message": "No data"})
-            continue
+            if df is None:
+                results.append({"pair": name, "message": "No data"})
+                continue
 
-        signal = generate_signal(df, name)
-        signal["pair"] = name
-        results.append(signal)
+            signal = generate_signal(df, name)
+            signal["pair"] = name
+            results.append(signal)
+
+        except Exception as e:
+            results.append({"pair": name, "error": str(e)})
 
     return jsonify(results)
 
@@ -263,7 +234,7 @@ def dashboard():
     return render_template_string("""
     <html>
     <body style="background:#0f172a;color:white;text-align:center;">
-    <h2>🚀 LIMIT EXECUTION BOT</h2>
+    <h2>🛡 SAFE TRADING BOT</h2>
     <div id="data"></div>
 
     <script>
@@ -273,7 +244,7 @@ def dashboard():
 
         let html = "";
         data.forEach(d=>{
-            html += `<p><b>${d.pair}</b>: ${d.action || d.message} | ${d.status || ""}</p>`;
+            html += `<p><b>${d.pair}</b>: ${d.action || d.message || d.error}</p>`;
         });
 
         document.getElementById("data").innerHTML = html;
