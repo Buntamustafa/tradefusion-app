@@ -135,10 +135,10 @@ Entry: {price}
 
 
 # =========================
-# SCANNER LOOP
+# SCANNER
 # =========================
 def scan_market():
-    print("Scanning...")
+    print("Scanning market...")
 
     for symbol in SYMBOLS:
         signal = generate_signal(symbol)
@@ -147,6 +147,9 @@ def scan_market():
             send_telegram(signal)
 
 
+# =========================
+# AUTO LOOP
+# =========================
 def run_bot():
     schedule.every(1).minutes.do(scan_market)
 
@@ -156,6 +159,10 @@ def run_bot():
 
 
 # =========================
-# START BACKGROUND BOT
+# START BACKGROUND THREAD
 # =========================
-threading.Thread(target=run_bot, daemon=True).start()
+def start_background():
+    threading.Thread(target=run_bot, daemon=True).start()
+
+
+start_background()
