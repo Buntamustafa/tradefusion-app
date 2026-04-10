@@ -1,231 +1,160 @@
 from flask import Flask, jsonify
-from flask_cors import CORS
-import pandas as pd
-import numpy as np
 import yfinance as yf
+import pandas as pd
+import ta
+import time
+import os
 from telegram_bot import send_telegram
 
 app = Flask(__name__)
-CORS(app)
 
-PAIRS = {
-    "EURUSD": "EURUSD=X",
-    "GBPUSD": "GBPUSD=X",
-    "USDCAD": "USDCAD=X",
-    "XAUUSD": "GC=F",
-    "BTCUSD": "BTC-USD"
-}
+# CONFIG
+PAIRS = ["EURUSD=X", "GBPUSD=X", "USDCAD=X", "GC=F", "CL=F", "BTC-USD"]
 
-# =========================
+TIMEFRAME = "15m"
+HIGHER_TIMEFRAME = "1h"
+
+# FILTER SETTINGS
+ATR_THRESHOLD = 0.0005
+MIN_TREND_STRENGTH = 0.0003
+
+# ===============================
 # FETCH DATA
-# =========================
-def get_data(symbol, interval="5m"):
+# ===============================
+def get_data(symbol, interval):
     try:
         df = yf.download(symbol, period="2d", interval=interval, progress=False)
-        df.dropna(inplace=True)
         return df
     except:
         return None
 
-# =========================
-# STRUCTURE (BOS)
-# =========================
-def detect_bos(df):
-    if len(df) < 20:
-        return None
+# ===============================
+# TREND (EMA)
+# ===============================
+def get_trend(df):
+    df["ema50"] = ta.trend.ema_indicator(df["Close"], window=50)
+    df["ema200"] = ta.trend.ema_indicator(df["Close"], window=200)
 
-    if df["High"].iloc[-1] > df["High"].iloc[-5:-1].max():
-        return "bullish"
+    if df["ema50"].iloc[-1] > df["ema200"].iloc[-1]:
+        return "BUY"
+    elif df["ema50"].iloc[-1] < df["ema200"].iloc[-1]:
+        return "SELL"
+    return "NONE"
 
-    if df["Low"].iloc[-1] < df["Low"].iloc[-5:-1].min():
-        return "bearish"
+# ===============================
+# TREND STRENGTH
+# ===============================
+def trend_strength(df):
+    return abs(df["ema50"].iloc[-1] - df["ema200"].iloc[-1])
 
-    return None
+# ===============================
+# VOLATILITY (ATR)
+# ===============================
+def get_atr(df):
+    atr = ta.volatility.average_true_range(df["High"], df["Low"], df["Close"])
+    return atr.iloc[-1]
 
-# =========================
-# FVG (Improved)
-# =========================
-def detect_fvg(df):
-    if len(df) < 5:
-        return None
-
-    for i in range(len(df)-3, len(df)-1):
-        if df["Low"].iloc[i] > df["High"].iloc[i-1]:
-            return "bullish"
-        if df["High"].iloc[i] < df["Low"].iloc[i-1]:
-            return "bearish"
-
-    return None
-
-# =========================
-# ORDER BLOCK (Improved)
-# =========================
-def detect_ob(df):
-    candles = df.iloc[-6:-1]
-
-    bullish = candles[candles["Close"] < candles["Open"]]
-    bearish = candles[candles["Close"] > candles["Open"]]
-
-    if len(bullish) >= 3:
-        return "bullish"
-
-    if len(bearish) >= 3:
-        return "bearish"
-
-    return None
-
-# =========================
-# LIQUIDITY SWEEP (NEW)
-# =========================
+# ===============================
+# LIQUIDITY SWEEP (SNIPER ENTRY)
+# ===============================
 def liquidity_sweep(df):
-    recent_high = df["High"].iloc[-1]
-    prev_high = df["High"].iloc[-10:-1].max()
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
 
-    recent_low = df["Low"].iloc[-1]
-    prev_low = df["Low"].iloc[-10:-1].min()
+    # Sweep below (BUY)
+    if last["Low"] < prev["Low"] and last["Close"] > prev["Low"]:
+        return "BUY"
 
-    if recent_high > prev_high:
-        return "sell"
-    if recent_low < prev_low:
-        return "buy"
-
-    return None
-
-# =========================
-# SNIPER ENTRY CANDLE
-# =========================
-def sniper_candle(df, direction):
-    candle = df.iloc[-1]
-
-    body = abs(candle["Close"] - candle["Open"])
-    wick = candle["High"] - candle["Low"]
-
-    if direction == "bullish":
-        return candle["Close"] > candle["Open"] and body > wick * 0.6
-
-    if direction == "bearish":
-        return candle["Close"] < candle["Open"] and body > wick * 0.6
-
-    return False
-
-# =========================
-# VOLATILITY FILTER
-# =========================
-def volatility_ok(df):
-    atr = (df["High"] - df["Low"]).rolling(14).mean().iloc[-1]
-    return atr > atr.mean()
-
-# =========================
-# SPREAD FILTER (SIMULATED)
-# =========================
-def spread_ok(df):
-    spread = abs(df["Close"].iloc[-1] - df["Open"].iloc[-1])
-    candle_range = df["High"].iloc[-1] - df["Low"].iloc[-1]
-    return spread < candle_range * 0.4
-
-# =========================
-# MULTI-TIMEFRAME ALIGNMENT
-# =========================
-def mtf_alignment(symbol):
-    df_5 = get_data(symbol, "5m")
-    df_15 = get_data(symbol, "15m")
-
-    if df_5 is None or df_15 is None:
-        return None
-
-    bos_5 = detect_bos(df_5)
-    bos_15 = detect_bos(df_15)
-
-    if bos_5 == bos_15:
-        return bos_5
+    # Sweep above (SELL)
+    if last["High"] > prev["High"] and last["Close"] < prev["High"]:
+        return "SELL"
 
     return None
 
-# =========================
-# ACCURACY BOOST (NEW CORE)
-# =========================
-def confidence_score(bos, fvg, ob, sweep):
-    score = 0
+# ===============================
+# SIGNAL ENGINE
+# ===============================
+def generate_signal(symbol):
+    df_ltf = get_data(symbol, TIMEFRAME)
+    df_htf = get_data(symbol, HIGHER_TIMEFRAME)
 
-    if bos: score += 25
-    if fvg: score += 25
-    if ob: score += 25
-    if sweep: score += 25
+    if df_ltf is None or df_htf is None or len(df_ltf) < 50:
+        return {"pair": symbol, "message": "No data"}
 
-    return score
+    # Indicators
+    df_ltf["ema50"] = ta.trend.ema_indicator(df_ltf["Close"], window=50)
+    df_ltf["ema200"] = ta.trend.ema_indicator(df_ltf["Close"], window=200)
 
-# =========================
-# SNIPER ENGINE (FINAL)
-# =========================
-def sniper_signal(pair, symbol):
-    df = get_data(symbol)
+    trend_ltf = get_trend(df_ltf)
+    trend_htf = get_trend(df_htf)
 
-    if df is None or len(df) < 50:
-        return {"pair": pair, "message": "No data"}
+    atr = get_atr(df_ltf)
+    strength = trend_strength(df_ltf)
 
-    bos = detect_bos(df)
-    fvg = detect_fvg(df)
-    ob = detect_ob(df)
-    sweep = liquidity_sweep(df)
-    mtf = mtf_alignment(symbol)
+    entry = liquidity_sweep(df_ltf)
 
-    if not mtf:
-        return {"pair": pair, "message": "No MTF alignment"}
+    # ===============================
+    # STRICT CONDITIONS
+    # ===============================
+    if atr < ATR_THRESHOLD:
+        return {"pair": symbol, "message": "Low volatility"}
 
-    if not volatility_ok(df):
-        return {"pair": pair, "message": "Low volatility"}
+    if strength < MIN_TREND_STRENGTH:
+        return {"pair": symbol, "message": "Weak trend"}
 
-    if not spread_ok(df):
-        return {"pair": pair, "message": "High spread"}
+    if trend_ltf != trend_htf:
+        return {"pair": symbol, "message": "No alignment"}
 
-    score = confidence_score(bos, fvg, ob, sweep)
+    if entry is None:
+        return {"pair": symbol, "message": "No sniper setup"}
 
-    direction = mtf
-    price = df["Close"].iloc[-1]
+    # ===============================
+    # SIGNAL STRENGTH
+    # ===============================
+    signal_type = "MEDIUM"
 
-    # 🔥 STRICT SNIPER (HIGH CONFIDENCE ONLY)
-    if score >= 75 and bos == fvg == ob == mtf:
-        if sniper_candle(df, direction):
-            message = f"""
-🔥 SNIPER TRADE
+    if strength > MIN_TREND_STRENGTH * 2:
+        signal_type = "STRONG"
 
-Pair: {pair}
-Direction: {direction.upper()}
-Entry: {round(price,5)}
+    price = df_ltf["Close"].iloc[-1]
 
-Confidence: {score}%
+    message = f"""
+🔥 {signal_type} SNIPER SIGNAL
+
+Pair: {symbol}
+Direction: {entry}
+Price: {price:.5f}
+
+Trend: {trend_ltf} (HTF aligned)
+ATR: {atr:.5f}
+
+⚡ Entry: Liquidity Sweep
 """
-            send_telegram(message)
 
-            return {
-                "pair": pair,
-                "signal": direction,
-                "confidence": score
-            }
+    # SEND TELEGRAM ALERT
+    send_telegram(message)
 
-    # ⚠️ EARLY WARNING (CONTROLLED)
-    if score >= 50:
-        send_telegram(f"⚠️ {pair} forming setup... ({score}%)")
+    return {
+        "pair": symbol,
+        "signal": entry,
+        "type": signal_type,
+        "price": float(price)
+    }
 
-        return {
-            "pair": pair,
-            "type": "EARLY",
-            "confidence": score
-        }
-
-    return {"pair": pair, "message": "No sniper setup"}
-
-# =========================
-# ROUTE
-# =========================
+# ===============================
+# API ROUTE
+# ===============================
 @app.route("/")
 def home():
     results = []
-
-    for pair, symbol in PAIRS.items():
-        results.append(sniper_signal(pair, symbol))
+    for pair in PAIRS:
+        results.append(generate_signal(pair))
+        time.sleep(1)
 
     return jsonify(results)
 
+# ===============================
+# RUN
+# ===============================
 if __name__ == "__main__":
-    app.run()
+    app.run(debug=True)
