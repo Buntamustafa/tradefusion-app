@@ -1,198 +1,145 @@
-from flask import Flask, jsonify
+from flask import Flask
 import yfinance as yf
 import pandas as pd
-from datetime import datetime
+import numpy as np
+import schedule
+import time
+import threading
 from telegram_bot import send_telegram
 
 app = Flask(__name__)
 
-PAIRS = ["EURUSD=X", "GBPUSD=X", "USDCAD=X", "EURGBP=X", "BTC-USD", "GC=F"]
+PAIRS = [
+    "EURUSD=X",
+    "GBPUSD=X",
+    "EURGBP=X",
+    "USDCAD=X",
+    "GC=F",      # Gold
+    "CL=F",      # Oil
+    "BTC-USD"
+]
 
-# =========================
-# DATA
-# =========================
-def get_data(symbol, interval):
-    try:
-        df = yf.download(symbol, period="2d", interval=interval, progress=False)
-        return df if not df.empty else None
-    except:
-        return None
+# -----------------------------
+# MARKET DATA
+# -----------------------------
+def get_data(symbol, interval="5m"):
+    df = yf.download(symbol, period="2d", interval=interval)
+    df.dropna(inplace=True)
+    return df
 
-# =========================
-# INDICATORS
-# =========================
-def atr(df):
-    return (df["High"] - df["Low"]).rolling(14).mean().iloc[-1]
+# -----------------------------
+# SMART MONEY LOGIC
+# -----------------------------
+def detect_bos(df):
+    return df['High'].iloc[-1] > df['High'].iloc[-3]
 
-# =========================
-# SMART MONEY CORE
-# =========================
-def liquidity_sweep(df):
-    return df["High"].iloc[-1] > df["High"].rolling(10).max().iloc[-2] or \
-           df["Low"].iloc[-1] < df["Low"].rolling(10).min().iloc[-2]
+def detect_liquidity_sweep(df):
+    return df['Low'].iloc[-1] < df['Low'].iloc[-3]
 
-def bos(df):
-    return df["Close"].iloc[-1] > df["High"].iloc[-2] or \
-           df["Close"].iloc[-1] < df["Low"].iloc[-2]
+def detect_order_block(df):
+    return df['Close'].iloc[-2] < df['Open'].iloc[-2]
 
-def fvg(df):
-    return df["Low"].iloc[-1] > df["High"].iloc[-3] or \
-           df["High"].iloc[-1] < df["Low"].iloc[-3]
-
-def order_block(df):
-    last = df.iloc[-2]
-    return abs(last["Close"] - last["Open"]) > (last["High"] - last["Low"]) * 0.5
-
-# =========================
-# MULTI TIMEFRAME
-# =========================
-def mtf_bias(symbol):
-    df1 = get_data(symbol, "1h")
-    df2 = get_data(symbol, "15m")
-
-    if df1 is None or df2 is None:
-        return None
-
-    htf = df1["Close"].iloc[-1] > df1["Close"].rolling(20).mean().iloc[-1]
-    mtf = df2["Close"].iloc[-1] > df2["High"].iloc[-2]
-
-    if htf and mtf:
-        return "BUY"
-    if not htf and not mtf:
-        return "SELL"
-
-    return None
-
-# =========================
-# 5M ENTRY REFINEMENT
-# =========================
-def refined_entry(df, direction):
-    last = df.iloc[-1]
-    prev = df.iloc[-2]
-
-    body = abs(last["Close"] - last["Open"])
-    wick = last["High"] - last["Low"]
-
-    strong = body > wick * 0.6
-
-    if direction == "BUY":
-        return last["Close"] > prev["High"] and strong
-
-    if direction == "SELL":
-        return last["Close"] < prev["Low"] and strong
-
-    return False
-
-# =========================
-# 1M SNIPER ENTRY (FINAL TRIGGER)
-# =========================
-def sniper_1m(df, direction):
-    last = df.iloc[-1]
-    prev = df.iloc[-2]
-
-    # BUY precision
-    if direction == "BUY":
-        return (
-            last["Low"] < prev["Low"] and
-            last["Close"] > last["Open"] and
-            last["Close"] > prev["High"]
-        )
-
-    # SELL precision
-    if direction == "SELL":
-        return (
-            last["High"] > prev["High"] and
-            last["Close"] < last["Open"] and
-            last["Close"] < prev["Low"]
-        )
-
-    return False
-
-# =========================
-# KILL ZONE
-# =========================
 def kill_zone():
+    from datetime import datetime
     hour = datetime.utcnow().hour
-    return 6 <= hour <= 9 or 12 <= hour <= 15
+    return 7 <= hour <= 10 or 12 <= hour <= 15
 
-# =========================
+# -----------------------------
+# MULTI TIMEFRAME
+# -----------------------------
+def multi_tf(symbol):
+    df_15m = get_data(symbol, "15m")
+    df_5m = get_data(symbol, "5m")
+
+    trend = "BUY" if df_15m['Close'].iloc[-1] > df_15m['Open'].iloc[-1] else "SELL"
+    entry = "BUY" if df_5m['Close'].iloc[-1] > df_5m['Open'].iloc[-1] else "SELL"
+
+    return trend == entry, trend
+
+# -----------------------------
+# SNIPER ENTRY (1m)
+# -----------------------------
+def sniper_entry(symbol):
+    df = get_data(symbol, "1m")
+    last = df.iloc[-1]
+
+    body = abs(last['Close'] - last['Open'])
+    wick = (last['High'] - last['Low'])
+
+    return body > (wick * 0.6)
+
+# -----------------------------
 # SIGNAL ENGINE
-# =========================
-def analyze(pair):
-    df_15 = get_data(pair, "15m")
-    df_5 = get_data(pair, "5m")
-    df_1 = get_data(pair, "1m")
+# -----------------------------
+def generate_signal(symbol):
+    df = get_data(symbol)
 
-    if df_15 is None or df_5 is None or df_1 is None:
-        return {"pair": pair, "message": "No data"}
+    bos = detect_bos(df)
+    sweep = detect_liquidity_sweep(df)
+    ob = detect_order_block(df)
+    kz = kill_zone()
 
-    direction = mtf_bias(pair)
-    if not direction:
-        return {"pair": pair, "message": "No MTF alignment"}
+    mtf_ok, direction = multi_tf(symbol)
+    sniper = sniper_entry(symbol)
 
-    if atr(df_15) < 0.0008:
-        return {"pair": pair, "message": "Low volatility"}
+    score = sum([bos, sweep, ob, kz, mtf_ok, sniper])
 
-    # Smart money confluence
-    score = 0
-    if liquidity_sweep(df_5): score += 2
-    if bos(df_5): score += 2
-    if fvg(df_5): score += 1
-    if order_block(df_5): score += 2
-
-    # Entry refinement
-    if not refined_entry(df_5, direction):
-        return {"pair": pair, "message": "No refined entry"}
-
-    # 1M sniper trigger
-    if not sniper_1m(df_1, direction):
-        return {"pair": pair, "message": "Waiting 1M sniper"}
-
-    # Strength classification
-    if score >= 6:
+    if score >= 5:
         strength = "🔥 STRONG"
-    elif score >= 4:
+    elif score >= 3:
         strength = "⚡ MEDIUM"
     else:
-        return {"pair": pair, "message": "No sniper setup"}
+        return None
 
-    if not kill_zone() and strength == "🔥 STRONG":
-        strength = "⚡ MEDIUM"
+    zone = "Kill Zone" if kz else "Outside Kill Zone"
 
-    message = f"""
-{strength} SNIPER ENTRY
+    return f"""
+{strength} SIGNAL
 
-Pair: {pair}
+Pair: {symbol}
 Direction: {direction}
 
-Entry: 1M Precision Trigger
-Session: {"Kill Zone" if kill_zone() else "Outside"}
+✔ BOS: {bos}
+✔ Liquidity Sweep: {sweep}
+✔ Order Block: {ob}
+✔ Kill Zone: {zone}
+✔ Multi TF: {mtf_ok}
+✔ Sniper Entry (1m): {sniper}
 """
 
-    send_telegram(message)
+# -----------------------------
+# SCANNER
+# -----------------------------
+def scan_markets():
+    print("Scanning markets...")
 
-    return {
-        "pair": pair,
-        "signal": direction,
-        "strength": strength
-    }
+    for pair in PAIRS:
+        try:
+            signal = generate_signal(pair)
+            if signal:
+                print(f"Signal found: {pair}")
+                send_telegram(signal)
+        except Exception as e:
+            print(f"Error: {pair}", e)
 
-# =========================
-# ROUTES
-# =========================
+# -----------------------------
+# AUTO LOOP
+# -----------------------------
+def run_bot():
+    schedule.every(1).minutes.do(scan_markets)
+
+    while True:
+        schedule.run_pending()
+        time.sleep(1)
+
+# -----------------------------
+# START THREAD
+# -----------------------------
+threading.Thread(target=run_bot).start()
+
+# -----------------------------
+# WEB ROUTE (OPTIONAL)
+# -----------------------------
 @app.route("/")
 def home():
-    return "Sniper Bot Running"
-
-@app.route("/scan")
-def scan():
-    results = []
-    for pair in PAIRS:
-        results.append(analyze(pair))
-    return jsonify(results)
-
-# =========================
-# RUN
-# =========================
-if __name__ == "__main__":
-    app.run()
+    return "Bot is running 🚀"
