@@ -1,145 +1,179 @@
-from flask import Flask
 import yfinance as yf
 import pandas as pd
 import numpy as np
-import schedule
 import time
 import threading
+import schedule
+
 from telegram_bot import send_telegram
 
-app = Flask(__name__)
 
-PAIRS = [
-    "EURUSD=X",
-    "GBPUSD=X",
-    "EURGBP=X",
-    "USDCAD=X",
-    "GC=F",      # Gold
-    "CL=F",      # Oil
-    "BTC-USD"
-]
+# =========================
+# SETTINGS
+# =========================
+SYMBOLS = ["EURUSD=X", "GBPUSD=X", "XAUUSD=X"]
+TIMEFRAME = "1m"
 
-# -----------------------------
-# MARKET DATA
-# -----------------------------
-def get_data(symbol, interval="5m"):
-    df = yf.download(symbol, period="2d", interval=interval)
+
+# =========================
+# HELPERS
+# =========================
+def get_data(symbol, interval="1m", period="1d"):
+    df = yf.download(symbol, interval=interval, period=period, progress=False)
     df.dropna(inplace=True)
     return df
 
-# -----------------------------
-# SMART MONEY LOGIC
-# -----------------------------
-def detect_bos(df):
-    return df['High'].iloc[-1] > df['High'].iloc[-3]
 
-def detect_liquidity_sweep(df):
-    return df['Low'].iloc[-1] < df['Low'].iloc[-3]
+def is_kill_zone():
+    # London + NY session (UTC)
+    hour = pd.Timestamp.utcnow().hour
+    return (6 <= hour <= 10) or (12 <= hour <= 16)
 
-def detect_order_block(df):
-    return df['Close'].iloc[-2] < df['Open'].iloc[-2]
 
-def kill_zone():
-    from datetime import datetime
-    hour = datetime.utcnow().hour
-    return 7 <= hour <= 10 or 12 <= hour <= 15
+def detect_trend(df):
+    df["ema50"] = df["Close"].ewm(span=50).mean()
+    df["ema200"] = df["Close"].ewm(span=200).mean()
 
-# -----------------------------
-# MULTI TIMEFRAME
-# -----------------------------
-def multi_tf(symbol):
-    df_15m = get_data(symbol, "15m")
+    if df["ema50"].iloc[-1] > df["ema200"].iloc[-1]:
+        return "BUY"
+    elif df["ema50"].iloc[-1] < df["ema200"].iloc[-1]:
+        return "SELL"
+    return None
+
+
+def break_of_structure(df):
+    recent_high = df["High"].rolling(10).max().iloc[-2]
+    recent_low = df["Low"].rolling(10).min().iloc[-2]
+
+    if df["Close"].iloc[-1] > recent_high:
+        return "BUY"
+    elif df["Close"].iloc[-1] < recent_low:
+        return "SELL"
+    return None
+
+
+def liquidity_sweep(df):
+    high_sweep = df["High"].iloc[-1] > df["High"].iloc[-2]
+    low_sweep = df["Low"].iloc[-1] < df["Low"].iloc[-2]
+
+    if high_sweep:
+        return "SELL"
+    elif low_sweep:
+        return "BUY"
+    return None
+
+
+def order_block(df):
+    last_candle = df.iloc[-2]
+    current = df.iloc[-1]
+
+    if last_candle["Close"] < last_candle["Open"] and current["Close"] > current["Open"]:
+        return "BUY"
+    elif last_candle["Close"] > last_candle["Open"] and current["Close"] < current["Open"]:
+        return "SELL"
+    return None
+
+
+def sniper_entry(df):
+    # 1-minute precision entry
+    candle = df.iloc[-1]
+
+    body = abs(candle["Close"] - candle["Open"])
+    wick = candle["High"] - candle["Low"]
+
+    if body / wick > 0.6:
+        return True
+    return False
+
+
+# =========================
+# SIGNAL ENGINE
+# =========================
+def generate_signal(symbol):
+    df_1m = get_data(symbol, "1m")
     df_5m = get_data(symbol, "5m")
 
-    trend = "BUY" if df_15m['Close'].iloc[-1] > df_15m['Open'].iloc[-1] else "SELL"
-    entry = "BUY" if df_5m['Close'].iloc[-1] > df_5m['Open'].iloc[-1] else "SELL"
+    if len(df_1m) < 50 or len(df_5m) < 50:
+        return None
 
-    return trend == entry, trend
+    trend = detect_trend(df_5m)
+    bos = break_of_structure(df_1m)
+    sweep = liquidity_sweep(df_1m)
+    ob = order_block(df_1m)
+    sniper = sniper_entry(df_1m)
 
-# -----------------------------
-# SNIPER ENTRY (1m)
-# -----------------------------
-def sniper_entry(symbol):
-    df = get_data(symbol, "1m")
-    last = df.iloc[-1]
+    score = 0
+    direction = trend
 
-    body = abs(last['Close'] - last['Open'])
-    wick = (last['High'] - last['Low'])
+    if trend == bos:
+        score += 2
+    if trend == sweep:
+        score += 2
+    if trend == ob:
+        score += 2
+    if sniper:
+        score += 2
 
-    return body > (wick * 0.6)
+    if not is_kill_zone():
+        score -= 2  # reduce strength outside session
 
-# -----------------------------
-# SIGNAL ENGINE
-# -----------------------------
-def generate_signal(symbol):
-    df = get_data(symbol)
-
-    bos = detect_bos(df)
-    sweep = detect_liquidity_sweep(df)
-    ob = detect_order_block(df)
-    kz = kill_zone()
-
-    mtf_ok, direction = multi_tf(symbol)
-    sniper = sniper_entry(symbol)
-
-    score = sum([bos, sweep, ob, kz, mtf_ok, sniper])
-
-    if score >= 5:
+    if score >= 6:
         strength = "🔥 STRONG"
-    elif score >= 3:
+    elif score >= 4:
         strength = "⚡ MEDIUM"
     else:
         return None
 
-    zone = "Kill Zone" if kz else "Outside Kill Zone"
+    price = df_1m["Close"].iloc[-1]
 
-    return f"""
-{strength} SIGNAL
+    return {
+        "symbol": symbol,
+        "direction": direction,
+        "strength": strength,
+        "price": price
+    }
 
-Pair: {symbol}
-Direction: {direction}
 
-✔ BOS: {bos}
-✔ Liquidity Sweep: {sweep}
-✔ Order Block: {ob}
-✔ Kill Zone: {zone}
-✔ Multi TF: {mtf_ok}
-✔ Sniper Entry (1m): {sniper}
-"""
-
-# -----------------------------
+# =========================
 # SCANNER
-# -----------------------------
-def scan_markets():
-    print("Scanning markets...")
+# =========================
+def scan_market():
+    print("Scanning market...")
 
-    for pair in PAIRS:
-        try:
-            signal = generate_signal(pair)
-            if signal:
-                print(f"Signal found: {pair}")
-                send_telegram(signal)
-        except Exception as e:
-            print(f"Error: {pair}", e)
+    for symbol in SYMBOLS:
+        signal = generate_signal(symbol)
 
-# -----------------------------
+        if signal:
+            message = f"""
+🚀 SIGNAL ALERT
+
+Pair: {signal['symbol']}
+Type: {signal['direction']}
+Strength: {signal['strength']}
+Entry: {signal['price']}
+
+⏰ Kill Zone: {"YES" if is_kill_zone() else "NO"}
+"""
+            print(message)
+            send_telegram(message)
+
+
+# =========================
 # AUTO LOOP
-# -----------------------------
+# =========================
 def run_bot():
-    schedule.every(1).minutes.do(scan_markets)
+    schedule.every(1).minutes.do(scan_market)
 
     while True:
         schedule.run_pending()
         time.sleep(1)
 
-# -----------------------------
-# START THREAD
-# -----------------------------
-threading.Thread(target=run_bot).start()
 
-# -----------------------------
-# WEB ROUTE (OPTIONAL)
-# -----------------------------
-@app.route("/")
-def home():
-    return "Bot is running 🚀"
+# =========================
+# START
+# =========================
+if __name__ == "__main__":
+    send_telegram("🤖 Bot is LIVE and scanning markets...")
+
+    thread = threading.Thread(target=run_bot)
+    thread.start()
