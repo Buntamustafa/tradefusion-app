@@ -37,7 +37,7 @@ def set_cache(key, value):
     CACHE[key] = (value, time.time())
 
 # ===============================
-# FETCH FUNCTIONS
+# FETCH FOREX
 # ===============================
 def fetch_twelve(symbol):
     url = "https://api.twelvedata.com/time_series"
@@ -62,35 +62,16 @@ def fetch_twelve(symbol):
             for col in ["close", "high", "low"]:
                 df[col] = df[col].astype(float)
 
-            if len(df) < 50:
-                raise Exception("Not enough data")
-
-            return df
-
+            if len(df) >= 50:
+                return df
         except:
             time.sleep(1)
 
-    raise Exception("TwelveData failed")
+    return None
 
-def fetch_bybit(symbol):
-    try:
-        url = f"https://api.bybit.com/v5/market/kline?category=linear&symbol={symbol}&interval=5&limit=100"
-        r = requests.get(url, timeout=10)
-        data = r.json()
-
-        candles = data["result"]["list"]
-
-        df = pd.DataFrame(candles, columns=[
-            "time","open","high","low","close","volume","turnover"
-        ]).iloc[::-1]
-
-        for col in ["open","close","high","low"]:
-            df[col] = df[col].astype(float)
-
-        return df
-    except:
-        return None
-
+# ===============================
+# FETCH CRYPTO (BINANCE)
+# ===============================
 def fetch_binance(symbol):
     urls = [
         f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval=5m&limit=100",
@@ -116,23 +97,86 @@ def fetch_binance(symbol):
             except:
                 time.sleep(1)
 
-    return fetch_bybit(symbol)
+    return None
 
+# ===============================
+# FETCH CRYPTO (BYBIT)
+# ===============================
+def fetch_bybit(symbol):
+    try:
+        url = f"https://api.bybit.com/v5/market/kline?category=linear&symbol={symbol}&interval=5&limit=100"
+        r = requests.get(url, timeout=10)
+        data = r.json()
+
+        if "result" not in data:
+            return None
+
+        candles = data["result"]["list"]
+
+        df = pd.DataFrame(candles, columns=[
+            "time","open","high","low","close","volume","turnover"
+        ]).iloc[::-1]
+
+        for col in ["open","close","high","low"]:
+            df[col] = df[col].astype(float)
+
+        return df
+    except:
+        return None
+
+# ===============================
+# 🆕 FETCH CRYPTO (COINGECKO FINAL BACKUP)
+# ===============================
+def fetch_coingecko():
+    try:
+        url = "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart"
+        params = {"vs_currency": "usd", "days": "1"}
+
+        r = requests.get(url, params=params, timeout=10)
+        data = r.json()
+
+        prices = data["prices"]
+
+        df = pd.DataFrame(prices, columns=["time","close"])
+
+        df["high"] = df["close"]
+        df["low"] = df["close"]
+
+        return df
+    except:
+        return None
+
+# ===============================
+# GET DATA (ULTRA SAFE)
+# ===============================
 def get_data(name, info):
     cached = get_cache(name)
+
+    for _ in range(2):
+        try:
+            if info["type"] == "crypto":
+                df = fetch_binance(info["symbol"])
+
+                if df is None:
+                    df = fetch_bybit(info["symbol"])
+
+                if df is None:
+                    df = fetch_coingecko()
+            else:
+                df = fetch_twelve(info["symbol"])
+
+            if df is not None and len(df) >= 50:
+                set_cache(name, df)
+                return df
+
+        except:
+            time.sleep(1)
+
     if cached:
+        print(f"Using cache for {name}")
         return cached
 
-    if info["type"] == "crypto":
-        df = fetch_binance(info["symbol"])
-    else:
-        df = fetch_twelve(info["symbol"])
-
-    if df is None or len(df) < 50:
-        raise Exception("Data fetch failed")
-
-    set_cache(name, df)
-    return df
+    return None
 
 # ===============================
 # ANALYSIS
@@ -160,29 +204,25 @@ def confirmation(df):
         return "SELL"
     return None
 
-# ===============================
-# VOLATILITY DETECTION
-# ===============================
 def get_volatility(df):
     return (df["high"] - df["low"]).rolling(10).mean().iloc[-1]
 
 # ===============================
-# SIGNAL ENGINE (AUTO SWITCH)
+# SIGNAL ENGINE
 # ===============================
 def generate_signal(df):
     trend, rsi, entry = analyze(df)
     confirm = confirmation(df)
     volatility = get_volatility(df)
 
-    # 🎯 SNIPER (HIGH VOLATILITY)
+    # 🎯 SNIPER
     if volatility > df["close"].mean() * 0.002:
         if confirm == trend and 45 < rsi < 65:
-            signal = trend
             return {
-                "action": signal,
+                "action": trend,
                 "entry": round(entry,4),
                 "sl": round(entry*0.995,4),
-                "tp": round(entry*1.03 if signal=="BUY" else entry*0.97,4),
+                "tp": round(entry*1.03 if trend=="BUY" else entry*0.97,4),
                 "confidence": "90%",
                 "strength": "SNIPER 🎯",
                 "reason": f"High volatility | RSI={round(rsi,1)}"
@@ -228,11 +268,23 @@ def signals():
     for name, info in PAIRS.items():
         try:
             df = get_data(name, info)
+
+            if df is None:
+                results.append({
+                    "pair": name,
+                    "message": "Data unavailable (safe mode)"
+                })
+                continue
+
             signal = generate_signal(df)
             signal["pair"] = name
             results.append(signal)
+
         except Exception as e:
-            results.append({"pair": name, "error": str(e)})
+            results.append({
+                "pair": name,
+                "error": str(e)
+            })
 
     return jsonify(results)
 
@@ -244,7 +296,7 @@ def dashboard():
     return render_template_string("""
     <html>
     <body style="background:#0f172a;color:white;text-align:center;font-family:sans-serif;">
-    <h2>🚀 Smart TradeFusion Dashboard</h2>
+    <h2>🚀 Ultimate TradeFusion</h2>
     <div id="data"></div>
 
     <script>
