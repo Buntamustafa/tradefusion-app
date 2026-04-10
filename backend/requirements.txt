@@ -3,4 +3,4 @@ flask-cors
 pandas
 requests
 gunicorn
-ta==0.10.2
+yfinance
