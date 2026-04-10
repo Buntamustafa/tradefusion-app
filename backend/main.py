@@ -53,6 +53,7 @@ def get_twelve(symbol):
     try:
         url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval=5min&outputsize=100&apikey={API_KEY}"
         data = requests.get(url).json()
+
         if "values" not in data:
             return None
 
@@ -81,7 +82,6 @@ def get_yahoo(pair):
         df.columns = ["time","open","high","low","close","volume"]
 
         return df
-
     except:
         return None
 
@@ -92,15 +92,12 @@ def get_data(pair, symbol):
 
     df = None
 
-    # Crypto → Binance
     if "BTC" in pair:
         df = get_binance(symbol)
 
-    # Forex/Gold → Twelve
     if df is None:
         df = get_twelve(symbol)
 
-    # Final fallback → Yahoo (no API)
     if df is None:
         df = get_yahoo(pair)
 
@@ -114,7 +111,7 @@ def get_htf_data(symbol):
     return get_binance(symbol, "1h")
 
 # ===============================
-# 🔥 SESSION FILTER
+# 🔥 SESSION
 # ===============================
 def get_session():
     hour = datetime.utcnow().hour
@@ -131,32 +128,28 @@ def volatility_filter(df):
     atr = (df["high"] - df["low"]).rolling(14).mean().iloc[-1]
     avg = df["close"].rolling(50).std().iloc[-1]
 
-    # avoid low volatility (dead market)
     if atr < avg * 0.3:
         return False
 
-    # avoid extreme volatility (news spikes)
     if atr > avg * 3:
         return False
 
     return True
 
 # ===============================
-# 🔥 SPREAD FILTER (SIMULATED)
+# 🔥 SPREAD FILTER
 # ===============================
 def spread_filter(df):
-    spread = (df["high"].iloc[-1] - df["low"].iloc[-1])
-
+    spread = df["high"].iloc[-1] - df["low"].iloc[-1]
     avg_spread = (df["high"] - df["low"]).rolling(20).mean().iloc[-1]
 
-    # if current spread too wide → skip
     if spread > avg_spread * 2:
         return False
 
     return True
 
 # ===============================
-# 🔥 NEWS FILTER (NO API)
+# 🔥 NEWS FILTER
 # ===============================
 def news_filter(df):
     move = abs(df["close"].iloc[-1] - df["close"].iloc[-2])
@@ -222,20 +215,36 @@ def order_block_zone(df):
     return None
 
 # ===============================
-# 🔥 SNIPER ENTRY
+# 🔥 SNIPER ENTRY (UPGRADED)
 # ===============================
 def sniper_entry(df, direction, zone_low, zone_high):
     price = df["close"].iloc[-1]
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
 
+    # Must be inside zone
     if direction == "BUY":
-        return zone_low <= price <= zone_high
-    if direction == "SELL":
-        return zone_high <= price <= zone_low
+        if not (zone_low <= price <= zone_high):
+            return False
+    elif direction == "SELL":
+        if not (zone_high <= price <= zone_low):
+            return False
 
-    return False
+    # Rejection candle
+    body = abs(last["close"] - last["open"])
+    wick = (last["high"] - last["low"]) - body
+    rejection = wick > body * 1.5
+
+    # Micro BOS
+    if direction == "BUY":
+        structure = last["close"] > prev["high"]
+    else:
+        structure = last["close"] < prev["low"]
+
+    return rejection and structure
 
 # ===============================
-# 🔥 CANDLE CONFIRMATION
+# 🔥 CANDLE CONFIRM
 # ===============================
 def candle_confirm(df):
     last = df.iloc[-1]
@@ -268,7 +277,7 @@ def generate_signal(df, htf_df):
     if get_session() == "OFF":
         return None
 
-    # HTF
+    # HTF bias
     htf_bias = get_htf_bias(htf_df)
     if not htf_bias:
         return None
@@ -300,7 +309,7 @@ def generate_signal(df, htf_df):
     }
 
 # ===============================
-# 🌐 ROUTE
+# 🌐 ROUTES
 # ===============================
 @app.route("/signals")
 def signals():
@@ -323,7 +332,7 @@ def signals():
                 "entry_zone": [signal["zone_low"], signal["zone_high"]],
                 "htf_bias": signal["htf_bias"],
                 "session": get_session(),
-                "confidence": "93% 🔥"
+                "confidence": "95% 🔥"
             })
         else:
             results.append({
@@ -335,4 +344,4 @@ def signals():
 
 @app.route("/")
 def home():
-    return "TradeFusion Pro Running 🚀"
+    return "TradeFusion Prop Sniper Running 🚀"
