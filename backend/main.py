@@ -14,9 +14,10 @@ app = Flask(__name__)
 # SETTINGS
 # =========================
 SYMBOLS = ["EURUSD=X", "GBPUSD=X", "XAUUSD=X"]
+last_signal = {}
 
 # =========================
-# ROUTE (RENDER NEEDS THIS)
+# ROUTE
 # =========================
 @app.route("/")
 def home():
@@ -24,19 +25,33 @@ def home():
 
 
 # =========================
-# HELPERS
+# DATA FETCH (STABLE)
 # =========================
 def get_data(symbol, interval="1m", period="1d"):
-    df = yf.download(symbol, interval=interval, period=period, progress=False)
-    df.dropna(inplace=True)
-    return df
+    for _ in range(3):
+        try:
+            df = yf.download(symbol, interval=interval, period=period, progress=False)
+            df.dropna(inplace=True)
+
+            if not df.empty:
+                return df
+        except:
+            time.sleep(1)
+
+    return pd.DataFrame()
 
 
+# =========================
+# SMART TIME FILTER
+# =========================
 def is_kill_zone():
     hour = pd.Timestamp.utcnow().hour
     return (6 <= hour <= 10) or (12 <= hour <= 16)
 
 
+# =========================
+# TREND (HTF CONFIRMATION)
+# =========================
 def detect_trend(df):
     df["ema50"] = df["Close"].ewm(span=50).mean()
     df["ema200"] = df["Close"].ewm(span=200).mean()
@@ -48,13 +63,16 @@ def detect_trend(df):
     return None
 
 
+# =========================
+# STRUCTURE + LIQUIDITY
+# =========================
 def break_of_structure(df):
-    recent_high = df["High"].rolling(10).max().iloc[-2]
-    recent_low = df["Low"].rolling(10).min().iloc[-2]
+    high = df["High"].rolling(10).max().iloc[-2]
+    low = df["Low"].rolling(10).min().iloc[-2]
 
-    if df["Close"].iloc[-1] > recent_high:
+    if df["Close"].iloc[-1] > high:
         return "BUY"
-    elif df["Close"].iloc[-1] < recent_low:
+    elif df["Close"].iloc[-1] < low:
         return "SELL"
     return None
 
@@ -69,29 +87,50 @@ def liquidity_sweep(df):
 
 def order_block(df):
     last = df.iloc[-2]
-    current = df.iloc[-1]
+    curr = df.iloc[-1]
 
-    if last["Close"] < last["Open"] and current["Close"] > current["Open"]:
+    if last["Close"] < last["Open"] and curr["Close"] > curr["Open"]:
         return "BUY"
-    elif last["Close"] > last["Open"] and current["Close"] < current["Open"]:
+    elif last["Close"] > last["Open"] and curr["Close"] < curr["Open"]:
         return "SELL"
     return None
 
 
+# =========================
+# SNIPER ENTRY (STRICT)
+# =========================
 def sniper_entry(df):
-    candle = df.iloc[-1]
-    body = abs(candle["Close"] - candle["Open"])
-    wick = candle["High"] - candle["Low"]
+    c = df.iloc[-1]
+    body = abs(c["Close"] - c["Open"])
+    wick = c["High"] - c["Low"]
 
-    return body / wick > 0.6 if wick != 0 else False
+    if wick == 0:
+        return False
+
+    # stricter precision
+    return (body / wick) > 0.7
 
 
 # =========================
-# SIGNAL ENGINE
+# VOLATILITY FILTER (NEW)
+# =========================
+def volatility_filter(df):
+    df["range"] = df["High"] - df["Low"]
+    avg = df["range"].rolling(10).mean().iloc[-1]
+    current = df["range"].iloc[-1]
+
+    return current > avg  # only trade when volatility is good
+
+
+# =========================
+# SIGNAL ENGINE (BOOSTED)
 # =========================
 def generate_signal(symbol):
     df_1m = get_data(symbol, "1m")
     df_5m = get_data(symbol, "5m")
+
+    if df_1m.empty or df_5m.empty:
+        return None
 
     if len(df_1m) < 50 or len(df_5m) < 50:
         return None
@@ -101,54 +140,79 @@ def generate_signal(symbol):
     sweep = liquidity_sweep(df_1m)
     ob = order_block(df_1m)
     sniper = sniper_entry(df_1m)
+    vol = volatility_filter(df_1m)
 
+    # ===== ACCURACY BOOST LOGIC =====
     score = 0
+    confirmations = 0
 
-    if trend == bos:
-        score += 2
-    if trend == sweep:
-        score += 2
-    if trend == ob:
-        score += 2
+    signals = [bos, sweep, ob]
+
+    for s in signals:
+        if s == trend:
+            score += 2
+            confirmations += 1
+
     if sniper:
+        score += 2
+
+    if vol:
         score += 2
 
     if not is_kill_zone():
         score -= 2
 
-    if score < 4:
+    # 🔥 STRICT FILTER
+    if confirmations < 2:
         return None
 
-    strength = "🔥 STRONG" if score >= 6 else "⚡ MEDIUM"
+    if score < 6:
+        return None
+
+    # choose best direction
+    direction = trend
+
     price = df_1m["Close"].iloc[-1]
+    strength = "🔥 STRONG" if score >= 8 else "⚡ MEDIUM"
 
     return f"""
 🚀 SIGNAL ALERT
 
 Pair: {symbol}
-Type: {trend}
+Type: {direction}
 Strength: {strength}
 Entry: {price}
 
+📊 Confirmations: {confirmations}/3
+⚡ Volatility: {"High" if vol else "Low"}
 ⏰ Kill Zone: {"YES" if is_kill_zone() else "NO"}
 """
 
 
 # =========================
-# SCANNER
+# SCANNER (SAFE)
 # =========================
 def scan_market():
+    global last_signal
     print("Scanning market...")
 
     for symbol in SYMBOLS:
-        signal = generate_signal(symbol)
-        if signal:
-            print(signal)
-            send_telegram(signal)
+        try:
+            signal = generate_signal(symbol)
+
+            if signal and last_signal.get(symbol) != signal:
+                last_signal[symbol] = signal
+                print(signal)
+                send_telegram(signal)
+
+            time.sleep(2)  # API protection
+
+        except Exception as e:
+            print(f"Error scanning {symbol}: {e}")
 
 
 # =========================
-# AUTO LOOP
+# LOOP
 # =========================
 def run_bot():
     schedule.every(1).minutes.do(scan_market)
@@ -159,7 +223,7 @@ def run_bot():
 
 
 # =========================
-# SAFE THREAD START
+# START SAFE
 # =========================
 bot_started = False
 
@@ -168,11 +232,14 @@ def start_background():
     if not bot_started:
         bot_started = True
         print("Starting bot thread...")
+
+        try:
+            send_telegram("🤖 Bot is LIVE with Accuracy Boost!")
+        except:
+            print("Telegram failed")
+
         threading.Thread(target=run_bot, daemon=True).start()
 
 
-# =========================
-# START (SAFE FOR RENDER)
-# =========================
 if os.environ.get("RUN_MAIN") == "true" or not app.debug:
     start_background()
