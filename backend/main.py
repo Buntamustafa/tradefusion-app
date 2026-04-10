@@ -42,13 +42,12 @@ def get_binance(symbol, tf="5m"):
             "time","open","high","low","close","volume",
             "ct","qv","n","tb","tq","ignore"
         ])
-
         df = df.astype(float)
         return df
     except:
         return None
 
-def get_yahoo(pair):
+def get_yahoo(pair, tf="5m"):
     try:
         import yfinance as yf
 
@@ -58,7 +57,9 @@ def get_yahoo(pair):
             "BTC/USD": "BTC-USD"
         }
 
-        ticker = yf.download(mapping[pair], interval="5m", period="1d")
+        period = "1d" if tf == "5m" else "2d"
+
+        ticker = yf.download(mapping[pair], interval=tf, period=period)
 
         if ticker.empty:
             return None
@@ -87,7 +88,9 @@ def get_twelve(symbol):
     except:
         return None
 
-# 🔥 FIXED DATA PIPELINE
+# ===============================
+# 🔥 DATA PIPELINE (FIXED)
+# ===============================
 def get_data(pair, symbol):
     cached = get_cache(pair)
     if cached is not None:
@@ -95,18 +98,18 @@ def get_data(pair, symbol):
 
     df = None
 
-    # 1. Binance (best for BTC)
+    # Binance first (BTC best)
     try:
         if "BTC" in pair:
             df = get_binance(symbol)
     except:
         df = None
 
-    # 2. Yahoo fallback (CRITICAL)
+    # Yahoo fallback
     if df is None:
-        df = get_yahoo(pair)
+        df = get_yahoo(pair, "5m")
 
-    # 3. Twelve fallback (optional)
+    # Twelve fallback
     if df is None:
         df = get_twelve(symbol)
 
@@ -116,11 +119,27 @@ def get_data(pair, symbol):
 
     return None
 
-def get_htf_data(symbol):
-    return get_binance(symbol, "1h")
+# ===============================
+# 🔥 HTF DATA (FIXED)
+# ===============================
+def get_htf_data(pair, symbol):
+    df = None
+
+    # Binance first
+    try:
+        if "BTC" in pair:
+            df = get_binance(symbol, "1h")
+    except:
+        df = None
+
+    # Yahoo fallback (CRITICAL FIX)
+    if df is None:
+        df = get_yahoo(pair, "1h")
+
+    return df
 
 # ===============================
-# SESSION FILTER
+# SESSION
 # ===============================
 def get_session():
     hour = datetime.utcnow().hour
@@ -136,14 +155,12 @@ def get_session():
 def volatility_filter(df):
     atr = (df["high"] - df["low"]).rolling(14).mean().iloc[-1]
     avg = df["close"].rolling(50).std().iloc[-1]
-
     return avg * 0.3 < atr < avg * 3
 
 def spread_filter(df):
     spread = df["high"].iloc[-1] - df["low"].iloc[-1]
-    avg_spread = (df["high"] - df["low"]).rolling(20).mean().iloc[-1]
-
-    return spread < avg_spread * 2
+    avg = (df["high"] - df["low"]).rolling(20).mean().iloc[-1]
+    return spread < avg * 2
 
 def news_filter(df):
     move = abs(df["close"].iloc[-1] - df["close"].iloc[-2])
@@ -156,12 +173,12 @@ def get_htf_bias(df):
     if df is None or len(df) < 50:
         return None
 
-    last = df["close"].iloc[-1]
     ma = df["close"].rolling(50).mean().iloc[-1]
+    price = df["close"].iloc[-1]
 
-    if last > ma:
+    if price > ma:
         return "BUY"
-    elif last < ma:
+    elif price < ma:
         return "SELL"
 
     return None
@@ -172,14 +189,12 @@ def get_htf_bias(df):
 def liquidity_sweep(df):
     high = df["high"].rolling(10).max().iloc[-2]
     low = df["low"].rolling(10).min().iloc[-2]
-
     last = df.iloc[-1]
 
     if last["high"] > high:
         return "BUY"
     elif last["low"] < low:
         return "SELL"
-
     return None
 
 def fvg_zone(df):
@@ -209,7 +224,6 @@ def candle_confirm(df):
         return "BUY"
     if last["close"] < last["open"] and prev["close"] > prev["open"]:
         return "SELL"
-
     return None
 
 # ===============================
@@ -286,7 +300,7 @@ def generate_signal(df, htf_df):
     }
 
 # ===============================
-# 🌐 ROUTES
+# ROUTES
 # ===============================
 @app.route("/signals")
 def signals():
@@ -294,7 +308,7 @@ def signals():
 
     for pair, symbol in PAIRS.items():
         df = get_data(pair, symbol)
-        htf_df = get_htf_data(symbol)
+        htf_df = get_htf_data(pair, symbol)
 
         if df is None or htf_df is None:
             results.append({"pair": pair, "message": "No data"})
