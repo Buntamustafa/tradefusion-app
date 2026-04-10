@@ -18,7 +18,7 @@ PAIRS = {
 }
 
 # ===============================
-# 🔥 CACHE
+# CACHE
 # ===============================
 def get_cache(pair):
     if pair in CACHE:
@@ -31,33 +31,18 @@ def set_cache(pair, data):
     CACHE[pair] = (data, time.time())
 
 # ===============================
-# 🔥 DATA SOURCES
+# DATA SOURCES
 # ===============================
 def get_binance(symbol, tf="5m"):
     try:
         url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={tf}&limit=100"
-        data = requests.get(url).json()
+        data = requests.get(url, timeout=5).json()
 
         df = pd.DataFrame(data, columns=[
             "time","open","high","low","close","volume",
             "ct","qv","n","tb","tq","ignore"
         ])
-        df = df.astype(float)
-        return df
-    except:
-        return None
 
-def get_twelve(symbol):
-    if not API_KEY:
-        return None
-    try:
-        url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval=5min&outputsize=100&apikey={API_KEY}"
-        data = requests.get(url).json()
-
-        if "values" not in data:
-            return None
-
-        df = pd.DataFrame(data["values"])
         df = df.astype(float)
         return df
     except:
@@ -85,6 +70,24 @@ def get_yahoo(pair):
     except:
         return None
 
+def get_twelve(symbol):
+    if not API_KEY:
+        return None
+    try:
+        url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval=5min&outputsize=100&apikey={API_KEY}"
+        data = requests.get(url, timeout=5).json()
+
+        if "values" not in data:
+            return None
+
+        df = pd.DataFrame(data["values"])
+        df = df.astype(float)
+
+        return df
+    except:
+        return None
+
+# 🔥 FIXED DATA PIPELINE
 def get_data(pair, symbol):
     cached = get_cache(pair)
     if cached is not None:
@@ -92,14 +95,20 @@ def get_data(pair, symbol):
 
     df = None
 
-    if "BTC" in pair:
-        df = get_binance(symbol)
+    # 1. Binance (best for BTC)
+    try:
+        if "BTC" in pair:
+            df = get_binance(symbol)
+    except:
+        df = None
 
-    if df is None:
-        df = get_twelve(symbol)
-
+    # 2. Yahoo fallback (CRITICAL)
     if df is None:
         df = get_yahoo(pair)
+
+    # 3. Twelve fallback (optional)
+    if df is None:
+        df = get_twelve(symbol)
 
     if df is not None and not df.empty:
         set_cache(pair, df)
@@ -111,7 +120,7 @@ def get_htf_data(symbol):
     return get_binance(symbol, "1h")
 
 # ===============================
-# 🔥 SESSION
+# SESSION FILTER
 # ===============================
 def get_session():
     hour = datetime.utcnow().hour
@@ -122,43 +131,26 @@ def get_session():
     return "OFF"
 
 # ===============================
-# 🔥 VOLATILITY FILTER
+# FILTERS
 # ===============================
 def volatility_filter(df):
     atr = (df["high"] - df["low"]).rolling(14).mean().iloc[-1]
     avg = df["close"].rolling(50).std().iloc[-1]
 
-    if atr < avg * 0.3:
-        return False
+    return avg * 0.3 < atr < avg * 3
 
-    if atr > avg * 3:
-        return False
-
-    return True
-
-# ===============================
-# 🔥 SPREAD FILTER
-# ===============================
 def spread_filter(df):
     spread = df["high"].iloc[-1] - df["low"].iloc[-1]
     avg_spread = (df["high"] - df["low"]).rolling(20).mean().iloc[-1]
 
-    if spread > avg_spread * 2:
-        return False
+    return spread < avg_spread * 2
 
-    return True
-
-# ===============================
-# 🔥 NEWS FILTER
-# ===============================
 def news_filter(df):
     move = abs(df["close"].iloc[-1] - df["close"].iloc[-2])
-    if move > df["close"].std() * 2:
-        return True
-    return False
+    return move > df["close"].std() * 2
 
 # ===============================
-# 🔥 HTF BIAS
+# HTF BIAS
 # ===============================
 def get_htf_bias(df):
     if df is None or len(df) < 50:
@@ -175,7 +167,7 @@ def get_htf_bias(df):
     return None
 
 # ===============================
-# 🔥 LIQUIDITY SWEEP
+# SMART MONEY LOGIC
 # ===============================
 def liquidity_sweep(df):
     high = df["high"].rolling(10).max().iloc[-2]
@@ -187,11 +179,9 @@ def liquidity_sweep(df):
         return "BUY"
     elif last["low"] < low:
         return "SELL"
+
     return None
 
-# ===============================
-# 🔥 FVG
-# ===============================
 def fvg_zone(df):
     for i in range(len(df)-3, len(df)-1):
         if df["low"].iloc[i] > df["high"].iloc[i-2]:
@@ -200,9 +190,6 @@ def fvg_zone(df):
             return ("SELL", df["low"].iloc[i-2], df["high"].iloc[i])
     return None
 
-# ===============================
-# 🔥 ORDER BLOCK
-# ===============================
 def order_block_zone(df):
     last = df.iloc[-1]
     prev = df.iloc[-2]
@@ -214,38 +201,6 @@ def order_block_zone(df):
 
     return None
 
-# ===============================
-# 🔥 SNIPER ENTRY (UPGRADED)
-# ===============================
-def sniper_entry(df, direction, zone_low, zone_high):
-    price = df["close"].iloc[-1]
-    last = df.iloc[-1]
-    prev = df.iloc[-2]
-
-    # Must be inside zone
-    if direction == "BUY":
-        if not (zone_low <= price <= zone_high):
-            return False
-    elif direction == "SELL":
-        if not (zone_high <= price <= zone_low):
-            return False
-
-    # Rejection candle
-    body = abs(last["close"] - last["open"])
-    wick = (last["high"] - last["low"]) - body
-    rejection = wick > body * 1.5
-
-    # Micro BOS
-    if direction == "BUY":
-        structure = last["close"] > prev["high"]
-    else:
-        structure = last["close"] < prev["low"]
-
-    return rejection and structure
-
-# ===============================
-# 🔥 CANDLE CONFIRM
-# ===============================
 def candle_confirm(df):
     last = df.iloc[-1]
     prev = df.iloc[-2]
@@ -258,13 +213,38 @@ def candle_confirm(df):
     return None
 
 # ===============================
-# 🚀 FINAL ENGINE
+# 🔥 SNIPER ENTRY
+# ===============================
+def sniper_entry(df, direction, zone_low, zone_high):
+    price = df["close"].iloc[-1]
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
+
+    if direction == "BUY":
+        if not (zone_low <= price <= zone_high):
+            return False
+    else:
+        if not (zone_high <= price <= zone_low):
+            return False
+
+    body = abs(last["close"] - last["open"])
+    wick = (last["high"] - last["low"]) - body
+    rejection = wick > body * 1.5
+
+    if direction == "BUY":
+        structure = last["close"] > prev["high"]
+    else:
+        structure = last["close"] < prev["low"]
+
+    return rejection and structure
+
+# ===============================
+# 🚀 ENGINE
 # ===============================
 def generate_signal(df, htf_df):
     if df is None or len(df) < 20:
         return None
 
-    # Filters
     if news_filter(df):
         return None
 
@@ -277,12 +257,10 @@ def generate_signal(df, htf_df):
     if get_session() == "OFF":
         return None
 
-    # HTF bias
     htf_bias = get_htf_bias(htf_df)
     if not htf_bias:
         return None
 
-    # Core logic
     liq = liquidity_sweep(df)
     fvg = fvg_zone(df)
     ob = order_block_zone(df)
@@ -294,7 +272,6 @@ def generate_signal(df, htf_df):
     if not (liq == fvg[0] == ob[0] == confirm == htf_bias):
         return None
 
-    # Sniper zone
     zone_low = min(fvg[1], ob[1])
     zone_high = max(fvg[2], ob[2])
 
