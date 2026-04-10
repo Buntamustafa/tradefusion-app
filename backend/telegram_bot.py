@@ -5,7 +5,7 @@ CHAT_ID = "7824834312"
 
 def send_telegram(message):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    
+
     payload = {
         "chat_id": CHAT_ID,
         "text": message
