@@ -1,9 +1,14 @@
 import requests
+import os
 
-BOT_TOKEN = "8672537389:AAH5e2SaNpwdOzfeOPKexT_IlZNr2k5s0BQ"
-CHAT_ID = "7824834312"
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
 
 def send_telegram(message):
+    if not BOT_TOKEN or not CHAT_ID:
+        print("Telegram not configured")
+        return
+
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
 
     payload = {
