@@ -31,21 +31,34 @@ def set_cache(pair, data):
     CACHE[pair] = (data, time.time())
 
 # ===============================
+# SAFE REQUEST (RETRY)
+# ===============================
+def safe_request(url, retries=3):
+    for _ in range(retries):
+        try:
+            res = requests.get(url, timeout=5)
+            if res.status_code == 200:
+                return res.json()
+        except:
+            time.sleep(1)
+    return None
+
+# ===============================
 # DATA SOURCES
 # ===============================
 def get_binance(symbol, tf="5m"):
-    try:
-        url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={tf}&limit=100"
-        data = requests.get(url, timeout=5).json()
+    url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={tf}&limit=100"
+    data = safe_request(url)
 
-        df = pd.DataFrame(data, columns=[
-            "time","open","high","low","close","volume",
-            "ct","qv","n","tb","tq","ignore"
-        ])
-        df = df.astype(float)
-        return df
-    except:
+    if not data or isinstance(data, dict):
         return None
+
+    df = pd.DataFrame(data)
+    df = df.iloc[:, :6]
+    df.columns = ["time","open","high","low","close","volume"]
+    df = df.astype(float)
+
+    return df
 
 def get_yahoo(pair, tf="5m"):
     try:
@@ -59,12 +72,12 @@ def get_yahoo(pair, tf="5m"):
 
         period = "1d" if tf == "5m" else "2d"
 
-        ticker = yf.download(mapping[pair], interval=tf, period=period)
+        df = yf.download(mapping[pair], interval=tf, period=period)
 
-        if ticker.empty:
+        if df.empty:
             return None
 
-        df = ticker.reset_index()
+        df = df.reset_index()
         df.columns = ["time","open","high","low","close","volume"]
 
         return df
@@ -74,72 +87,55 @@ def get_yahoo(pair, tf="5m"):
 def get_twelve(symbol):
     if not API_KEY:
         return None
-    try:
-        url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval=5min&outputsize=100&apikey={API_KEY}"
-        data = requests.get(url, timeout=5).json()
 
-        if "values" not in data:
-            return None
+    url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval=5min&outputsize=100&apikey={API_KEY}"
+    data = safe_request(url)
 
-        df = pd.DataFrame(data["values"])
-        df = df.astype(float)
-
-        return df
-    except:
+    if not data or "values" not in data:
         return None
 
+    df = pd.DataFrame(data["values"])
+    df = df.astype(float)
+
+    return df
+
 # ===============================
-# 🔥 DATA PIPELINE (FIXED)
+# 🔥 DATA PIPELINE (REAL HYBRID)
 # ===============================
 def get_data(pair, symbol):
     cached = get_cache(pair)
     if cached is not None:
         return cached
 
-    df = None
+    sources = [
+        lambda: get_binance(symbol),
+        lambda: get_yahoo(pair),
+        lambda: get_twelve(symbol)
+    ]
 
-    # Binance first (BTC best)
-    try:
-        if "BTC" in pair:
-            df = get_binance(symbol)
-    except:
-        df = None
+    for source in sources:
+        df = source()
+        if df is not None and not df.empty:
+            set_cache(pair, df)
+            return df
 
-    # Yahoo fallback
-    if df is None:
-        df = get_yahoo(pair, "5m")
+    return None
 
-    # Twelve fallback
-    if df is None:
-        df = get_twelve(symbol)
+def get_htf_data(pair, symbol):
+    sources = [
+        lambda: get_binance(symbol, "1h"),
+        lambda: get_yahoo(pair, "1h")
+    ]
 
-    if df is not None and not df.empty:
-        set_cache(pair, df)
-        return df
+    for source in sources:
+        df = source()
+        if df is not None and not df.empty:
+            return df
 
     return None
 
 # ===============================
-# 🔥 HTF DATA (FIXED)
-# ===============================
-def get_htf_data(pair, symbol):
-    df = None
-
-    # Binance first
-    try:
-        if "BTC" in pair:
-            df = get_binance(symbol, "1h")
-    except:
-        df = None
-
-    # Yahoo fallback (CRITICAL FIX)
-    if df is None:
-        df = get_yahoo(pair, "1h")
-
-    return df
-
-# ===============================
-# SESSION
+# SESSION FILTER
 # ===============================
 def get_session():
     hour = datetime.utcnow().hour
@@ -195,6 +191,7 @@ def liquidity_sweep(df):
         return "BUY"
     elif last["low"] < low:
         return "SELL"
+
     return None
 
 def fvg_zone(df):
@@ -224,10 +221,11 @@ def candle_confirm(df):
         return "BUY"
     if last["close"] < last["open"] and prev["close"] > prev["open"]:
         return "SELL"
+
     return None
 
 # ===============================
-# 🔥 SNIPER ENTRY
+# SNIPER ENTRY
 # ===============================
 def sniper_entry(df, direction, zone_low, zone_high):
     price = df["close"].iloc[-1]
@@ -253,7 +251,7 @@ def sniper_entry(df, direction, zone_low, zone_high):
     return rejection and structure
 
 # ===============================
-# 🚀 ENGINE
+# ENGINE
 # ===============================
 def generate_signal(df, htf_df):
     if df is None or len(df) < 20:
@@ -335,4 +333,4 @@ def signals():
 
 @app.route("/")
 def home():
-    return "TradeFusion Prop Sniper Running 🚀"
+    return "TradeFusion Hybrid Sniper Running 🚀"
