@@ -5,44 +5,59 @@ import time
 import threading
 import schedule
 import os
+import logging
 
 from telegram_bot import send_telegram
 
 app = Flask(__name__)
 
 # =========================
+# LOGGING
+# =========================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
+
+# =========================
 # SETTINGS
 # =========================
 SYMBOLS = ["EURUSD=X", "GBPUSD=X", "XAUUSD=X"]
 last_signal = {}
+last_sent_time = {}
 
 # =========================
-# ROUTE
+# ROUTE (UPTIMEROBOT)
 # =========================
 @app.route("/")
 def home():
+    print("Ping received")
     return "Bot is running ✅"
 
 
 # =========================
-# DATA FETCH (STABLE)
+# DATA FETCH (RETRY)
 # =========================
 def get_data(symbol, interval="1m", period="1d"):
-    for _ in range(3):
+    for attempt in range(5):
         try:
             df = yf.download(symbol, interval=interval, period=period, progress=False)
-            df.dropna(inplace=True)
 
-            if not df.empty:
+            if df is not None and not df.empty:
+                df.dropna(inplace=True)
                 return df
-        except:
-            time.sleep(1)
 
+        except Exception as e:
+            logging.warning(f"{symbol} retry {attempt+1} failed: {e}")
+
+        time.sleep(2)
+
+    logging.error(f"{symbol} FAILED after retries")
     return pd.DataFrame()
 
 
 # =========================
-# SMART TIME FILTER
+# TIME FILTER
 # =========================
 def is_kill_zone():
     hour = pd.Timestamp.utcnow().hour
@@ -50,7 +65,38 @@ def is_kill_zone():
 
 
 # =========================
-# TREND (HTF CONFIRMATION)
+# SMART NEWS SESSION
+# =========================
+def is_news_session():
+    hour = pd.Timestamp.utcnow().hour
+    return (7 <= hour <= 10) or (13 <= hour <= 16)
+
+
+# =========================
+# RSI
+# =========================
+def calculate_rsi(df, period=14):
+    delta = df["Close"].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(period).mean()
+    rs = gain / loss
+    return 100 - (100 / (1 + rs))
+
+
+def rsi_filter(df, direction):
+    df["rsi"] = calculate_rsi(df)
+    rsi = df["rsi"].iloc[-1]
+
+    if direction == "BUY" and rsi < 35:
+        return True
+    if direction == "SELL" and rsi > 65:
+        return True
+
+    return False
+
+
+# =========================
+# TREND (EMA)
 # =========================
 def detect_trend(df):
     df["ema50"] = df["Close"].ewm(span=50).mean()
@@ -64,7 +110,7 @@ def detect_trend(df):
 
 
 # =========================
-# STRUCTURE + LIQUIDITY
+# STRUCTURE
 # =========================
 def break_of_structure(df):
     high = df["High"].rolling(10).max().iloc[-2]
@@ -97,7 +143,7 @@ def order_block(df):
 
 
 # =========================
-# SNIPER ENTRY (STRICT)
+# ENTRY FILTERS
 # =========================
 def sniper_entry(df):
     c = df.iloc[-1]
@@ -107,51 +153,98 @@ def sniper_entry(df):
     if wick == 0:
         return False
 
-    # stricter precision
     return (body / wick) > 0.7
 
 
-# =========================
-# VOLATILITY FILTER (NEW)
-# =========================
 def volatility_filter(df):
     df["range"] = df["High"] - df["Low"]
     avg = df["range"].rolling(10).mean().iloc[-1]
     current = df["range"].iloc[-1]
 
-    return current > avg  # only trade when volatility is good
+    return current > avg
+
+
+def is_scalp(df):
+    df["range"] = df["High"] - df["Low"]
+    current = df["range"].iloc[-1]
+    avg = df["range"].rolling(20).mean().iloc[-1]
+
+    return current > avg * 1.5
 
 
 # =========================
-# SIGNAL ENGINE (BOOSTED)
+# TP / SL
+# =========================
+def calculate_tp_sl(df, direction):
+    atr = (df["High"] - df["Low"]).rolling(14).mean().iloc[-1]
+    price = df["Close"].iloc[-1]
+
+    if direction == "BUY":
+        sl = price - atr
+        tp = price + (atr * 2)
+    else:
+        sl = price + atr
+        tp = price - (atr * 2)
+
+    return round(tp, 5), round(sl, 5)
+
+
+# =========================
+# ANTI OVERTRADING
+# =========================
+def can_send(symbol):
+    now = time.time()
+
+    if symbol not in last_sent_time:
+        last_sent_time[symbol] = now
+        return True
+
+    if now - last_sent_time[symbol] > 600:
+        last_sent_time[symbol] = now
+        return True
+
+    return False
+
+
+# =========================
+# SIGNAL ENGINE
 # =========================
 def generate_signal(symbol):
     df_1m = get_data(symbol, "1m")
     df_5m = get_data(symbol, "5m")
+    df_15m = get_data(symbol, "15m")
+    df_1h = get_data(symbol, "1h")
 
-    if df_1m.empty or df_5m.empty:
+    if any(df.empty for df in [df_1m, df_5m, df_15m, df_1h]):
         return None
 
-    if len(df_1m) < 50 or len(df_5m) < 50:
+    trend_5m = detect_trend(df_5m)
+    trend_15m = detect_trend(df_15m)
+    trend_1h = detect_trend(df_1h)
+
+    if not (trend_5m == trend_15m == trend_1h):
         return None
 
-    trend = detect_trend(df_5m)
+    direction = trend_5m
+
     bos = break_of_structure(df_1m)
     sweep = liquidity_sweep(df_1m)
     ob = order_block(df_1m)
+
     sniper = sniper_entry(df_1m)
     vol = volatility_filter(df_1m)
+    rsi_ok = rsi_filter(df_1m, direction)
 
-    # ===== ACCURACY BOOST LOGIC =====
+    # =========================
+    # SCORING
+    # =========================
     score = 0
     confirmations = 0
 
-    signals = [bos, sweep, ob]
-
-    for s in signals:
-        if s == trend:
-            score += 2
+    for s in [bos, sweep, ob]:
+        if s == direction:
             confirmations += 1
+            score += 2
 
     if sniper:
         score += 2
@@ -159,56 +252,74 @@ def generate_signal(symbol):
     if vol:
         score += 2
 
-    if not is_kill_zone():
-        score -= 2
+    if rsi_ok:
+        score += 2
 
-    # 🔥 STRICT FILTER
-    if confirmations < 2:
+    if is_kill_zone():
+        score += 1
+
+    if is_news_session():
+        score += 2
+
+    # =========================
+    # SIGNAL TYPE
+    # =========================
+    signal_type = None
+
+    if confirmations >= 2:
+        if score >= 10:
+            signal_type = "🔥 STRICT"
+        elif 7 <= score < 10:
+            signal_type = "⚡ MEDIUM"
+
+    scalp_trade = False
+    if is_scalp(df_1m) and is_news_session():
+        scalp_trade = True
+
+    if not signal_type and not scalp_trade:
         return None
-
-    if score < 6:
-        return None
-
-    # choose best direction
-    direction = trend
 
     price = df_1m["Close"].iloc[-1]
-    strength = "🔥 STRONG" if score >= 8 else "⚡ MEDIUM"
+    tp, sl = calculate_tp_sl(df_1m, direction)
 
     return f"""
 🚀 SIGNAL ALERT
 
 Pair: {symbol}
 Type: {direction}
-Strength: {strength}
-Entry: {price}
+Signal: {signal_type if signal_type else "⚡ SCALP"}
 
+Entry: {price}
+TP: {tp}
+SL: {sl}
+
+⚡ Scalp Mode: {"YES" if scalp_trade else "NO"}
+📰 News Mode: {"YES" if is_news_session() else "NO"}
 📊 Confirmations: {confirmations}/3
-⚡ Volatility: {"High" if vol else "Low"}
-⏰ Kill Zone: {"YES" if is_kill_zone() else "NO"}
+📈 RSI OK: {"YES" if rsi_ok else "NO"}
 """
 
 
 # =========================
-# SCANNER (SAFE)
+# SCANNER
 # =========================
 def scan_market():
     global last_signal
-    print("Scanning market...")
+    logging.info("Scanning market...")
 
     for symbol in SYMBOLS:
         try:
             signal = generate_signal(symbol)
 
-            if signal and last_signal.get(symbol) != signal:
+            if signal and last_signal.get(symbol) != signal and can_send(symbol):
                 last_signal[symbol] = signal
-                print(signal)
+                logging.info(signal)
                 send_telegram(signal)
 
-            time.sleep(2)  # API protection
+            time.sleep(2)
 
         except Exception as e:
-            print(f"Error scanning {symbol}: {e}")
+            logging.error(f"{symbol} error: {e}")
 
 
 # =========================
@@ -223,7 +334,7 @@ def run_bot():
 
 
 # =========================
-# START SAFE
+# START
 # =========================
 bot_started = False
 
@@ -231,12 +342,12 @@ def start_background():
     global bot_started
     if not bot_started:
         bot_started = True
-        print("Starting bot thread...")
+        logging.info("Starting bot thread...")
 
         try:
-            send_telegram("🤖 Bot is LIVE with Accuracy Boost!")
+            send_telegram("🤖 Bot is LIVE (Smart News Mode)")
         except:
-            print("Telegram failed")
+            logging.warning("Telegram failed")
 
         threading.Thread(target=run_bot, daemon=True).start()
 
