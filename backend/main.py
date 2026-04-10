@@ -64,9 +64,6 @@ def is_kill_zone():
     return (6 <= hour <= 10) or (12 <= hour <= 16)
 
 
-# =========================
-# SMART NEWS SESSION
-# =========================
 def is_news_session():
     hour = pd.Timestamp.utcnow().hour
     return (7 <= hour <= 10) or (13 <= hour <= 16)
@@ -96,7 +93,7 @@ def rsi_filter(df, direction):
 
 
 # =========================
-# TREND (EMA)
+# TREND
 # =========================
 def detect_trend(df):
     df["ema50"] = df["Close"].ewm(span=50).mean()
@@ -235,9 +232,6 @@ def generate_signal(symbol):
     vol = volatility_filter(df_1m)
     rsi_ok = rsi_filter(df_1m, direction)
 
-    # =========================
-    # SCORING
-    # =========================
     score = 0
     confirmations = 0
 
@@ -248,33 +242,24 @@ def generate_signal(symbol):
 
     if sniper:
         score += 2
-
     if vol:
         score += 2
-
     if rsi_ok:
         score += 2
-
     if is_kill_zone():
         score += 1
-
     if is_news_session():
         score += 2
 
-    # =========================
-    # SIGNAL TYPE
-    # =========================
     signal_type = None
 
     if confirmations >= 2:
         if score >= 10:
             signal_type = "🔥 STRICT"
-        elif 7 <= score < 10:
+        elif score >= 7:
             signal_type = "⚡ MEDIUM"
 
-    scalp_trade = False
-    if is_scalp(df_1m) and is_news_session():
-        scalp_trade = True
+    scalp_trade = is_scalp(df_1m) and is_news_session()
 
     if not signal_type and not scalp_trade:
         return None
@@ -293,7 +278,7 @@ Entry: {price}
 TP: {tp}
 SL: {sl}
 
-⚡ Scalp Mode: {"YES" if scalp_trade else "NO"}
+⚡ Scalp: {"YES" if scalp_trade else "NO"}
 📰 News Mode: {"YES" if is_news_session() else "NO"}
 📊 Confirmations: {confirmations}/3
 📈 RSI OK: {"YES" if rsi_ok else "NO"}
@@ -304,7 +289,6 @@ SL: {sl}
 # SCANNER
 # =========================
 def scan_market():
-    global last_signal
     logging.info("Scanning market...")
 
     for symbol in SYMBOLS:
@@ -334,22 +318,22 @@ def run_bot():
 
 
 # =========================
-# START
+# START (FIXED NO SPAM)
 # =========================
-bot_started = False
-
 def start_background():
-    global bot_started
-    if not bot_started:
-        bot_started = True
-        logging.info("Starting bot thread...")
+    if os.environ.get("BOT_STARTED") == "1":
+        return
 
-        try:
-            send_telegram("🤖 Bot is LIVE (Smart News Mode)")
-        except:
-            logging.warning("Telegram failed")
+    os.environ["BOT_STARTED"] = "1"
 
-        threading.Thread(target=run_bot, daemon=True).start()
+    logging.info("Starting bot...")
+
+    try:
+        send_telegram("🤖 Bot is LIVE (Smart Mode)")
+    except:
+        logging.warning("Telegram failed")
+
+    threading.Thread(target=run_bot, daemon=True).start()
 
 
 if os.environ.get("RUN_MAIN") == "true" or not app.debug:
