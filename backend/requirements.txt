@@ -1,6 +1,8 @@
 flask
 flask-cors
 pandas
+numpy
 requests
 gunicorn
 yfinance
+ta==0.10.2
