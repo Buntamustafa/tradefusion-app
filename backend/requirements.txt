@@ -2,5 +2,5 @@ flask
 flask-cors
 pandas
 requests
-ta
 gunicorn
+ta==0.10.2
