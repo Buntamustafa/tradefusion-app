@@ -15,6 +15,7 @@ API_TOKEN = os.getenv("API_TOKEN")
 WS_URL = "wss://ws.derivws.com/websockets/v3?app_id=1089"
 
 ws = None
+connected = False
 
 # ===============================
 # 🌐 FLASK APP
@@ -26,7 +27,7 @@ app = Flask(__name__)
 # ===============================
 signals_log = []
 tick_prices = {}
-last_signal = None  # ✅ prevents duplicates
+last_signal = None
 
 # ===============================
 # 📊 SYMBOLS
@@ -38,6 +39,16 @@ symbols = [
     "cryBTCUSD",
     "cryETHUSD"
 ]
+
+# ===============================
+# 🔒 SAFE SEND
+# ===============================
+def safe_send(data):
+    try:
+        if ws and connected:
+            ws.send(json.dumps(data))
+    except Exception as e:
+        print("❌ Send failed:", e)
 
 # ===============================
 # 📉 INDICATORS
@@ -88,11 +99,13 @@ def calculate_strength(rsi, trend, momentum):
     if momentum:
         score += 30
 
-    if rsi:
-        if 40 < rsi < 60:
+    if rsi is not None:
+        if 45 < rsi < 55:
             score += 30
+        elif 40 < rsi < 60:
+            score += 25
         elif 30 < rsi < 70:
-            score += 20
+            score += 15
 
     return min(score, 100)
 
@@ -105,7 +118,10 @@ def fastSignal(data):
     if "tick" not in data:
         return
 
-    symbol = data.get("echo_req", {}).get("ticks", "")
+    symbol = data.get("tick", {}).get("symbol")
+    if not symbol:
+        return
+
     price = float(data["tick"]["quote"])
 
     if symbol not in tick_prices:
@@ -118,7 +134,11 @@ def fastSignal(data):
 
     prices = tick_prices[symbol]
 
-    if len(prices) < 20:
+    if len(prices) < 10:
+        return
+
+    # Prevent edge crash
+    if len(prices) < 5:
         return
 
     rsi = calculate_rsi(prices)
@@ -140,14 +160,25 @@ def fastSignal(data):
     if not (valid_buy or valid_sell):
         return
 
+    # 💎 SNIPER CONDITIONS
+    strong_trend = abs(ema9 - ema21) > (price * 0.001)
+    strong_momentum = abs(prices[-1] - prices[-5]) > (price * 0.0005)
+    perfect_rsi = rsi is not None and 45 < rsi < 55
+
     strength = calculate_strength(
         rsi,
         trend_up or trend_down,
         momentum_up or momentum_down
     )
 
+    # 🎯 QUALITY
     quality = "⚠ SCALP"
-    if strength > 75:
+
+    if strong_trend and strong_momentum and perfect_rsi and strength >= 95:
+        quality = "💎 ELITE SNIPER"
+    elif strength >= 90:
+        quality = "💎 ELITE"
+    elif strength > 75:
         quality = "🔥 STRONG"
     elif strength > 50:
         quality = "⚡ MEDIUM"
@@ -162,9 +193,14 @@ def fastSignal(data):
         "trend": "UPTREND" if trend_up else "DOWNTREND"
     }
 
-    # ✅ PREVENT DUPLICATES
-    if last_signal == result:
-        return
+    # Smarter duplicate filter
+    if last_signal:
+        same_symbol = last_signal["symbol"] == result["symbol"]
+        same_direction = last_signal["direction"] == result["direction"]
+        close_price = abs(last_signal["entry"] - price) < (price * 0.00005)
+
+        if same_symbol and same_direction and close_price:
+            return
 
     last_signal = result
     signals_log.append(result)
@@ -175,12 +211,14 @@ def fastSignal(data):
     print("🧠 SIGNAL:", result)
 
 # ===============================
-# 🔌 CONNECT
+# 🔌 CONNECT + AUTO RETRY
 # ===============================
 def connect():
     global ws
+
     while True:
         try:
+            print("🔄 Connecting to Deriv...")
             ws = WebSocketApp(
                 WS_URL,
                 on_open=on_open,
@@ -188,59 +226,81 @@ def connect():
                 on_error=on_error,
                 on_close=on_close
             )
-            ws.run_forever()
+            ws.run_forever(ping_interval=20, ping_timeout=10)
         except Exception as e:
-            print("Reconnect error:", e)
-            time.sleep(5)
+            print("❌ Connection error:", e)
 
-def on_open(ws):
-    print("✅ Connected")
+        print("⏳ Retrying in 5 seconds...")
+        time.sleep(5)
+
+def on_open(ws_instance):
+    global ws
+    ws = ws_instance
+    print("✅ Connected to Deriv")
     authorize()
 
 def on_message(ws, message):
+    global connected
     data = json.loads(message)
+    msg_type = data.get("msg_type")
 
-    if data.get("msg_type") == "authorize":
-        print("🔐 Authorized")
-        startFetching()
+    print("📩 MSG:", msg_type)
 
-    if data.get("msg_type") == "tick":
+    if msg_type == "authorize":
+        if "error" in data:
+            print("❌ Auth failed:", data)
+            connected = False
+            time.sleep(3)
+            authorize()
+        else:
+            print("🔐 Authorized SUCCESS")
+            connected = True
+            startFetching()
+
+    elif msg_type == "tick":
         fastSignal(data)
 
+    elif "error" in data:
+        print("❌ WS ERROR:", data["error"])
+
 def on_error(ws, error):
-    print("❌ Error:", error)
+    print("❌ WebSocket Error:", error)
 
 def on_close(ws, a, b):
-    print("🔌 Reconnecting...")
+    global connected
+    connected = False
+    print("🔌 Disconnected. Reconnecting...")
 
 # ===============================
 # 🔐 AUTHORIZE
 # ===============================
 def authorize():
     if not API_TOKEN:
-        print("❌ NO API TOKEN")
+        print("❌ NO API TOKEN SET")
         return
 
-    ws.send(json.dumps({"authorize": API_TOKEN}))
+    print("🔐 Sending auth...")
+    safe_send({"authorize": API_TOKEN})
 
 # ===============================
 # 📡 FETCH DATA
 # ===============================
 def startFetching():
+    print("📡 Subscribing to symbols...")
     for symbol in symbols:
-        ws.send(json.dumps({
+        safe_send({
             "ticks": symbol,
             "subscribe": 1
-        }))
+        })
 
 # ===============================
-# 🚀 BOT START (SAFE)
+# 🚀 BOT START
 # ===============================
 def run_bot():
     print("🚀 Bot started...")
     connect()
 
-if os.environ.get("RENDER"):
+if not os.environ.get("RUN_MAIN"):
     threading.Thread(target=run_bot, daemon=True).start()
 
 # ===============================
@@ -255,11 +315,28 @@ def dashboard():
 
 @app.route("/signals")
 def signals():
-    return jsonify(signals_log[-10:])  # ✅ last 10 only
+    return jsonify(signals_log[-10:])
 
-@app.route("/test")
-def test():
-    return "✅ Test route working!"
+@app.route("/force")
+def force():
+    test_signal = {
+        "symbol": "TEST",
+        "direction": "BUY",
+        "signal": "TEST SIGNAL",
+        "quality": "💎 ELITE SNIPER",
+        "strength": 100,
+        "entry": 12345,
+        "trend": "UPTREND"
+    }
+    signals_log.append(test_signal)
+    return jsonify({"status": "added"})
+
+@app.route("/status")
+def status():
+    return jsonify({
+        "connected": connected,
+        "signals_count": len(signals_log)
+    })
 
 # ===============================
 # 🚀 RUN
