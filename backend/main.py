@@ -5,40 +5,55 @@ import websocket
 import json
 import threading
 import time
+import os
+from flask import Flask, jsonify
 
-API_TOKEN = "pat_4f3bb0455ca7efe76bd34d5f18e7e2a44b62d697e906dbf4f9dffb4215cd18e0"  # 🔥 INSERT HERE
+API_TOKEN = os.getenv("API_TOKEN")
 WS_URL = "wss://ws.derivws.com/websockets/v3?app_id=1089"
 
 ws = None
 
 # ===============================
-# 📊 PAIRS (YOU REQUESTED)
+# 🌐 FLASK APP
+# ===============================
+app = Flask(__name__)
+
+# ===============================
+# 📊 SIGNAL STORAGE (NEW)
+# ===============================
+signals_log = []
+
+# ===============================
+# 📊 PAIRS
 # ===============================
 symbols = [
-    "frxEURUSD",  # EUR/USD
-    "frxXAUUSD",  # GOLD
-    "frxUSOIL",   # OIL
-    "cryBTCUSD",  # BTC
-    "cryETHUSD"   # ETH
+    "frxEURUSD",
+    "frxXAUUSD",
+    "frxUSOIL",
+    "cryBTCUSD",
+    "cryETHUSD"
 ]
 
 # ===============================
-# 🔊 SOUND ALERT (SAFE FOR SERVER)
+# 🔊 SOUND ALERT
 # ===============================
 def playSound():
-    print("🔊 Beep!")  # Server-safe (no audio crash)
+    print("🔊 Beep!")
 
 # ===============================
 # 🔌 CONNECT TO DERIV
 # ===============================
 def connect():
     global ws
+
     ws = websocket.WebSocketApp(
         WS_URL,
         on_open=on_open,
         on_message=on_message,
-        on_error=on_error
+        on_error=on_error,
+        on_close=on_close
     )
+
     ws.run_forever()
 
 def on_open(ws):
@@ -58,16 +73,25 @@ def on_message(ws, message):
 def on_error(ws, error):
     print("❌ Error:", error)
 
+def on_close(ws, close_status_code, close_msg):
+    print("🔌 Reconnecting...")
+    time.sleep(5)
+    connect()
+
 # ===============================
 # 🔐 AUTHORIZE
 # ===============================
 def authorize():
+    if not API_TOKEN:
+        print("❌ API TOKEN NOT FOUND!")
+        return
+
     ws.send(json.dumps({
         "authorize": API_TOKEN
     }))
 
 # ===============================
-# 📡 FETCH DATA (1m candles)
+# 📡 FETCH DATA
 # ===============================
 def startFetching():
     for symbol in symbols:
@@ -79,7 +103,7 @@ def startFetching():
         }))
 
 # ===============================
-# 🧠 MARKET ANALYSIS CORE
+# 🧠 MARKET ANALYSIS
 # ===============================
 def analyzeMarket(data):
     candles = data.get("candles", [])
@@ -95,32 +119,20 @@ def analyzeMarket(data):
     low = float(last["low"])
     close = float(last["close"])
 
-    # ===============================
-    # 📈 TREND STRUCTURE (NEW)
-    # ===============================
     highs = [float(c["high"]) for c in candles[-10:]]
     lows = [float(c["low"]) for c in candles[-10:]]
 
     uptrend = highs[-1] > highs[0] and lows[-1] > lows[0]
     downtrend = highs[-1] < highs[0] and lows[-1] < lows[0]
 
-    # ===============================
-    # 🧩 BOS (Break of Structure)
-    # ===============================
     bos = last["high"] > prev["high"] or last["low"] < prev["low"]
 
-    # ===============================
-    # 💧 LIQUIDITY SWEEP
-    # ===============================
     sweep = False
     if last["high"] > prev["high"] and close < prev["high"]:
         sweep = True
     if last["low"] < prev["low"] and close > prev["low"]:
         sweep = True
 
-    # ===============================
-    # ⚡ MINI FVG
-    # ===============================
     fvg = False
     c1 = candles[-3]
     c3 = candles[-1]
@@ -128,15 +140,9 @@ def analyzeMarket(data):
     if float(c1["high"]) < float(c3["low"]) or float(c1["low"]) > float(c3["high"]):
         fvg = True
 
-    # ===============================
-    # 🧱 SUPPORT / RESISTANCE
-    # ===============================
     resistance = max(highs)
     support = min(lows)
 
-    # ===============================
-    # 🎯 ENTRY + SL + TP
-    # ===============================
     entry = close
     sl = None
     tp = None
@@ -152,28 +158,38 @@ def analyzeMarket(data):
         sl = resistance
         tp = entry - (sl - entry) * 2
 
-    # ===============================
-    # 🎯 SIGNAL QUALITY
-    # ===============================
     signal = None
     quality = "⚠ SCALP"
 
     if bos and sweep and fvg and (uptrend or downtrend):
         signal = "SNIPER ENTRY 🎯"
         quality = "🔥 STRONG"
-
     elif bos and (sweep or fvg):
         signal = "ENTRY ⚡"
         quality = "⚡ MEDIUM"
-
     elif bos:
         signal = "QUICK SCALP ⚠"
         quality = "⚠ SCALP"
 
-    # ===============================
-    # 📢 OUTPUT
-    # ===============================
     if signal:
+        result = {
+            "symbol": symbol,
+            "direction": direction,
+            "signal": signal,
+            "quality": quality,
+            "entry": entry,
+            "sl": sl,
+            "tp": tp,
+            "trend": "UPTREND" if uptrend else "DOWNTREND" if downtrend else "RANGE"
+        }
+
+        # ✅ STORE SIGNAL (NEW)
+        signals_log.append(result)
+
+        # Keep only last 50 signals
+        if len(signals_log) > 50:
+            signals_log.pop(0)
+
         print(f"""
 ==============================
 📊 {symbol}
@@ -182,21 +198,60 @@ Direction: {direction}
 Quality: {quality}
 
 📍 Entry: {entry}
-🛑 Stop Loss: {sl}
-🎯 Take Profit: {tp}
-
-📈 Trend: {"UPTREND" if uptrend else "DOWNTREND" if downtrend else "RANGE"}
-
-✔ BOS: {"✅" if bos else "❌"}
-✔ Sweep: {"✅" if sweep else "❌"}
-✔ FVG: {"✅" if fvg else "❌"}
+🛑 SL: {sl}
+🎯 TP: {tp}
 ==============================
         """)
 
         playSound()
 
 # ===============================
+# 🌐 DASHBOARD ROUTES (NEW)
+# ===============================
+@app.route("/")
+def dashboard():
+    return f"""
+    <html>
+    <head>
+        <title>TradeFusion Dashboard</title>
+        <meta http-equiv="refresh" content="5">
+        <style>
+            body {{ background:#0f172a; color:white; font-family:sans-serif; }}
+            .card {{ background:#1e293b; padding:15px; margin:10px; border-radius:10px; }}
+        </style>
+    </head>
+    <body>
+        <h2>🚀 TradeFusion Live Signals</h2>
+        {"".join([f'''
+        <div class="card">
+            <b>{s["symbol"]}</b><br>
+            {s["signal"]} ({s["quality"]})<br>
+            Direction: {s["direction"]}<br>
+            Entry: {s["entry"]}<br>
+            SL: {s["sl"]}<br>
+            TP: {s["tp"]}
+        </div>
+        ''' for s in signals_log[::-1]])}
+    </body>
+    </html>
+    """
+
+@app.route("/signals")
+def get_signals():
+    return jsonify(signals_log)
+
+# ===============================
 # 🚀 START BOT
 # ===============================
+def start_bot():
+    thread = threading.Thread(target=connect)
+    thread.daemon = True
+    thread.start()
+
+start_bot()
+
+# ===============================
+# 🚀 RUN FLASK
+# ===============================
 if __name__ == "__main__":
-    connect()
+    app.run(host="0.0.0.0", port=10000)
