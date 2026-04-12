@@ -87,7 +87,7 @@ def fastSignal(data):
     if "tick" not in data:
         return
 
-    symbol = data["echo_req"].get("ticks", "")
+    symbol = data.get("echo_req", {}).get("ticks", "")
     price = float(data["tick"]["quote"])
 
     if symbol not in tick_prices:
@@ -107,7 +107,7 @@ def fastSignal(data):
     ema9 = calculate_ema(prices, 9)
     ema21 = calculate_ema(prices, 21)
 
-    if not rsi or not ema9 or not ema21:
+    if rsi is None or ema9 is None or ema21 is None:
         return
 
     momentum_up = prices[-1] > prices[-5]
@@ -143,7 +143,6 @@ def fastSignal(data):
     }
 
     signals_log.append(result)
-
     if len(signals_log) > 50:
         signals_log.pop(0)
 
@@ -197,7 +196,7 @@ def on_close(ws, close_status_code, close_msg):
 # ===============================
 def authorize():
     if not API_TOKEN:
-        print("❌ API TOKEN NOT FOUND! Set it in Render.")
+        print("❌ API TOKEN NOT FOUND!")
         return
 
     ws.send(json.dumps({
@@ -216,7 +215,6 @@ def startFetching():
             "count": 100
         }))
 
-    # ⚡ FAST TICKS
     for symbol in symbols:
         ws.send(json.dumps({
             "ticks": symbol,
@@ -224,7 +222,7 @@ def startFetching():
         }))
 
 # ===============================
-# 🧠 MARKET ANALYSIS (ORIGINAL)
+# 🧠 MARKET ANALYSIS
 # ===============================
 def analyzeMarket(data):
     candles = data.get("candles", [])
@@ -236,8 +234,6 @@ def analyzeMarket(data):
     last = candles[-1]
     prev = candles[-2]
 
-    high = float(last["high"])
-    low = float(last["low"])
     close = float(last["close"])
 
     highs = [float(c["high"]) for c in candles[-10:]]
@@ -248,32 +244,28 @@ def analyzeMarket(data):
 
     bos = last["high"] > prev["high"] or last["low"] < prev["low"]
 
-    sweep = False
-    if last["high"] > prev["high"] and close < prev["high"]:
-        sweep = True
-    if last["low"] < prev["low"] and close > prev["low"]:
-        sweep = True
+    sweep = (
+        (last["high"] > prev["high"] and close < prev["high"]) or
+        (last["low"] < prev["low"] and close > prev["low"])
+    )
 
-    fvg = False
-    c1 = candles[-3]
-    c3 = candles[-1]
-
-    if float(c1["high"]) < float(c3["low"]) or float(c1["low"]) > float(c3["high"]):
-        fvg = True
+    fvg = (
+        float(candles[-3]["high"]) < float(last["low"]) or
+        float(candles[-3]["low"]) > float(last["high"])
+    )
 
     resistance = max(highs)
     support = min(lows)
 
+    direction = None
     entry = close
     sl = None
     tp = None
-    direction = None
 
     if uptrend:
         direction = "BUY"
         sl = support
         tp = entry + (entry - sl) * 2
-
     elif downtrend:
         direction = "SELL"
         sl = resistance
@@ -282,7 +274,7 @@ def analyzeMarket(data):
     signal = None
     quality = "⚠ SCALP"
 
-    if bos and sweep and fvg and (uptrend or downtrend):
+    if bos and sweep and fvg:
         signal = "SNIPER ENTRY 🎯"
         quality = "🔥 STRONG"
     elif bos and (sweep or fvg):
@@ -290,7 +282,6 @@ def analyzeMarket(data):
         quality = "⚡ MEDIUM"
     elif bos:
         signal = "QUICK SCALP ⚠"
-        quality = "⚠ SCALP"
 
     if signal:
         result = {
@@ -301,11 +292,10 @@ def analyzeMarket(data):
             "entry": entry,
             "sl": sl,
             "tp": tp,
-            "trend": "UPTREND" if uptrend else "DOWNTREND" if downtrend else "RANGE"
+            "trend": "UPTREND" if uptrend else "DOWNTREND"
         }
 
         signals_log.append(result)
-
         if len(signals_log) > 50:
             signals_log.pop(0)
 
@@ -317,31 +307,7 @@ def analyzeMarket(data):
 # ===============================
 @app.route("/")
 def dashboard():
-    return f"""
-    <html>
-    <head>
-        <title>TradeFusion Dashboard</title>
-        <meta http-equiv="refresh" content="5">
-        <style>
-            body {{ background:#0f172a; color:white; font-family:sans-serif; }}
-            .card {{ background:#1e293b; padding:15px; margin:10px; border-radius:10px; }}
-        </style>
-    </head>
-    <body>
-        <h2>🚀 TradeFusion Live Signals</h2>
-        {"".join([f'''
-        <div class="card">
-            <b>{s["symbol"]}</b><br>
-            {s["signal"]} ({s["quality"]})<br>
-            Direction: {s["direction"]}<br>
-            Entry: {s["entry"]}<br>
-            SL: {s["sl"]}<br>
-            TP: {s["tp"]}
-        </div>
-        ''' for s in signals_log[::-1]])}
-    </body>
-    </html>
-    """
+    return jsonify(signals_log[::-1])
 
 @app.route("/signals")
 def get_signals():
@@ -355,11 +321,11 @@ def start_bot():
     thread.daemon = True
     thread.start()
 
-if os.environ.get("RUN_MAIN") != "true":
-    start_bot()
+start_bot()
 
 # ===============================
 # 🚀 RUN FLASK
 # ===============================
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=10000)
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
