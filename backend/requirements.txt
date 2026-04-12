@@ -1,7 +1,4 @@
 flask
-pandas
-numpy
-requests
 gunicorn
 websocket-client
 idna
