@@ -1,4 +1,4 @@
-from flask import Flask, render_template_string
+from flask import Flask, render_template_string, jsonify
 import requests, time, threading
 import pandas as pd
 
@@ -9,7 +9,6 @@ CHAT_ID = "YOUR_CHAT_ID"
 
 signals = []
 
-# 👥 MULTI PAIRS
 PAIRS = ["BTCUSDT", "ETHUSDT"]
 
 # 🔔 TELEGRAM
@@ -68,6 +67,12 @@ def liquidity_zone(df):
         return "LOW_ZONE"
     return "MID"
 
+# 🚨 NEWS / VOLATILITY DETECTOR
+def high_volatility(df):
+    candle = abs(df["c"].iloc[-1] - df["o"].iloc[-1])
+    avg = (df["h"] - df["l"]).rolling(10).mean().iloc[-1]
+    return candle > avg * 1.5
+
 # 🧠 SIGNAL LOGIC
 def generate_signal(pair):
     df_15m = get_data(pair, "15m")
@@ -79,44 +84,58 @@ def generate_signal(pair):
     ob = order_block(df_15m)
     zone = liquidity_zone(df_15m)
     rsi_val = rsi(df_15m).iloc[-1]
+    volatile = high_volatility(df_15m)
 
     signal_type = None
-    strength = "SCALP"
+    strength = "LOW"
 
-    # 🟣 ELITE
+    # 🟣 STRONG (strict)
     if trend_up and sweep == "BUY" and ob == "BUY" and zone == "LOW_ZONE" and rsi_val < 35:
         signal_type = "BUY"
-        strength = "ELITE"
+        strength = "STRONG"
 
     elif not trend_up and sweep == "SELL" and ob == "SELL" and zone == "HIGH_ZONE" and rsi_val > 65:
         signal_type = "SELL"
-        strength = "ELITE"
-
-    # 🔥 STRONG
-    elif sweep == ob and sweep is not None:
-        signal_type = sweep
         strength = "STRONG"
 
-    # ⚡ MEDIUM
-    elif sweep:
+    # 🔥 MEDIUM
+    elif sweep == ob and sweep is not None:
         signal_type = sweep
         strength = "MEDIUM"
+
+    # ⚡ LOW
+    elif sweep:
+        signal_type = sweep
+        strength = "LOW"
+
+    # 🌀 SCALP (range)
+    elif zone == "MID":
+        if rsi_val < 40:
+            signal_type = "BUY"
+            strength = "SCALP"
+        elif rsi_val > 60:
+            signal_type = "SELL"
+            strength = "SCALP"
 
     if signal_type:
         price = df_15m["c"].iloc[-1]
 
+        entry = round(price, 2)
+
         if signal_type == "BUY":
-            entry = round(price, 2)
             sl = round(price - 100, 2)
             tp = round(price + 200, 2)
         else:
-            entry = round(price, 2)
             sl = round(price + 100, 2)
             tp = round(price - 200, 2)
 
+        # 🚨 adjust for volatility (news)
+        if volatile:
+            tp = round(tp * 1.2, 2)
+
         signal = {
             "pair": pair,
-            "type": signal_type,
+            "signal": signal_type,
             "strength": strength,
             "entry": entry,
             "sl": sl,
@@ -146,64 +165,20 @@ def bot_loop():
             print(e)
         time.sleep(60)
 
+# 🌐 API
+@app.route("/api/signals")
+def api_signals():
+    return jsonify(signals)
+
 # 🌐 DASHBOARD
 @app.route("/dashboard")
 def dashboard():
-    return render_template_string("""
-    <html>
-    <head>
-        <meta http-equiv="refresh" content="10">
-    </head>
-
-    <body style="background:#0b1a2f;color:white;font-family:sans-serif;padding:15px;">
-
-    <h2>📊 TradeFusion PRO Signals</h2>
-
-    {% if signals|length == 0 %}
-        <div style="background:#132a4a;padding:20px;border-radius:10px;">
-            ⚠️ No signals yet...
-        </div>
-    {% endif %}
-
-    {% for s in signals %}
-    <div style="background:#132a4a;padding:15px;margin:10px 0;border-radius:12px;">
-
-        <b>{{s.pair}}</b> | {{s.type}} | ⏰ {{s.time}}<br><br>
-
-        {% if s.strength == "ELITE" %}
-            <span style="background:purple;padding:5px 10px;border-radius:8px;">🟣 ELITE</span>
-        {% elif s.strength == "STRONG" %}
-            <span style="background:red;padding:5px 10px;border-radius:8px;">🔥 STRONG</span>
-        {% elif s.strength == "MEDIUM" %}
-            <span style="background:orange;padding:5px 10px;border-radius:8px;">⚡ MEDIUM</span>
-        {% else %}
-            <span style="background:gray;padding:5px 10px;border-radius:8px;">⚠️ SCALP</span>
-        {% endif %}
-
-        <br><br>
-
-        💰 Entry: {{s.entry}}<br>
-        🛑 SL: {{s.sl}}<br>
-        🎯 TP: {{s.tp}}
-
-    </div>
-
-    <!-- 🔊 SOUND ALERT -->
-    <audio autoplay>
-        <source src="https://www.soundjay.com/buttons/sounds/button-3.mp3" type="audio/mpeg">
-    </audio>
-
-    {% endfor %}
-
-    </body>
-    </html>
-    """, signals=signals)
+    return render_template_string("<h2>Running...</h2>")
 
 @app.route("/")
 def home():
     return "Bot running ✅"
 
-# 🚀 START
 threading.Thread(target=bot_loop).start()
 
 if __name__ == "__main__":
