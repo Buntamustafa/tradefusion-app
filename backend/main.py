@@ -1,5 +1,5 @@
 # ===============================
-# 🔐 DERIV CONNECTION
+# 🔐 IMPORTS
 # ===============================
 from websocket import WebSocketApp
 import json
@@ -8,6 +8,9 @@ import time
 import os
 from flask import Flask, jsonify
 
+# ===============================
+# 🔐 CONFIG
+# ===============================
 API_TOKEN = os.getenv("API_TOKEN")
 WS_URL = "wss://ws.derivws.com/websockets/v3?app_id=1089"
 
@@ -19,13 +22,14 @@ ws = None
 app = Flask(__name__)
 
 # ===============================
-# 📊 SIGNAL STORAGE
+# 📊 STORAGE
 # ===============================
 signals_log = []
 tick_prices = {}
+last_signal = None  # ✅ prevents duplicates
 
 # ===============================
-# 📊 PAIRS
+# 📊 SYMBOLS
 # ===============================
 symbols = [
     "frxEURUSD",
@@ -34,12 +38,6 @@ symbols = [
     "cryBTCUSD",
     "cryETHUSD"
 ]
-
-# ===============================
-# 🔊 SOUND ALERT
-# ===============================
-def playSound():
-    print("🔊 Beep!")
 
 # ===============================
 # 📉 INDICATORS
@@ -99,9 +97,11 @@ def calculate_strength(rsi, trend, momentum):
     return min(score, 100)
 
 # ===============================
-# ⚡ FAST SIGNAL ENGINE
+# ⚡ SIGNAL ENGINE
 # ===============================
 def fastSignal(data):
+    global last_signal
+
     if "tick" not in data:
         return
 
@@ -140,7 +140,11 @@ def fastSignal(data):
     if not (valid_buy or valid_sell):
         return
 
-    strength = calculate_strength(rsi, trend_up or trend_down, momentum_up or momentum_down)
+    strength = calculate_strength(
+        rsi,
+        trend_up or trend_down,
+        momentum_up or momentum_down
+    )
 
     quality = "⚠ SCALP"
     if strength > 75:
@@ -158,16 +162,20 @@ def fastSignal(data):
         "trend": "UPTREND" if trend_up else "DOWNTREND"
     }
 
+    # ✅ PREVENT DUPLICATES
+    if last_signal == result:
+        return
+
+    last_signal = result
     signals_log.append(result)
 
     if len(signals_log) > 50:
         signals_log.pop(0)
 
-    print("🧠 AI SIGNAL:", result)
-    playSound()
+    print("🧠 SIGNAL:", result)
 
 # ===============================
-# 🔌 CONNECT TO DERIV
+# 🔌 CONNECT
 # ===============================
 def connect():
     global ws
@@ -226,7 +234,7 @@ def startFetching():
         }))
 
 # ===============================
-# 🚀 SAFE BOT START (IMPORTANT)
+# 🚀 BOT START (SAFE)
 # ===============================
 def run_bot():
     print("🚀 Bot started...")
@@ -239,16 +247,15 @@ if os.environ.get("RENDER"):
 # 🌐 ROUTES
 # ===============================
 @app.route("/")
-def home():
+@app.route("/dashboard")
+def dashboard():
     if not signals_log:
         return jsonify([{"message": "⏳ Waiting for signals..."}])
     return jsonify(signals_log[::-1])
 
 @app.route("/signals")
 def signals():
-    if not signals_log:
-        return jsonify([{"message": "⏳ Waiting for signals..."}])
-    return jsonify(signals_log)
+    return jsonify(signals_log[-10:])  # ✅ last 10 only
 
 @app.route("/test")
 def test():
