@@ -79,6 +79,11 @@ def calculate_ema(prices, period):
     return ema
 
 # ===============================
+# 🧠 MULTI-TIMEFRAME STORAGE
+# ===============================
+mtf_data = {}
+
+# ===============================
 # ⚡ FAST SIGNAL ENGINE (AI)
 # ===============================
 tick_prices = {}
@@ -87,10 +92,7 @@ def fastSignal(data):
     if "tick" not in data:
         return
 
-    symbol = data.get("echo_req", {}).get("ticks") or data.get("tick", {}).get("symbol", "")
-    if not symbol:
-        return
-
+    symbol = data.get("echo_req", {}).get("ticks") or data.get("tick", {}).get("symbol")
     price = float(data["tick"]["quote"])
 
     if symbol not in tick_prices:
@@ -103,7 +105,7 @@ def fastSignal(data):
 
     prices = tick_prices[symbol]
 
-    if len(prices) < 20:
+    if len(prices) < 25:
         return
 
     rsi = calculate_rsi(prices)
@@ -119,17 +121,34 @@ def fastSignal(data):
     trend_up = ema9 > ema21
     trend_down = ema9 < ema21
 
-    valid_buy = momentum_up and trend_up and rsi < 70
-    valid_sell = momentum_down and trend_down and rsi > 30
+    # 🔥 MULTI-TIMEFRAME CONFIRMATION
+    higher_tf = mtf_data.get(symbol, {})
+    ht_trend = higher_tf.get("trend")
+
+    valid_buy = momentum_up and trend_up and rsi < 70 and ht_trend == "UPTREND"
+    valid_sell = momentum_down and trend_down and rsi > 30 and ht_trend == "DOWNTREND"
 
     if not (valid_buy or valid_sell):
         return
 
+    # 🎯 AI FILTER (REMOVE BAD FAST SIGNALS)
+    strength_score = 0
+
+    if trend_up or trend_down:
+        strength_score += 1
+    if momentum_up or momentum_down:
+        strength_score += 1
+    if (valid_buy and rsi < 60) or (valid_sell and rsi > 40):
+        strength_score += 1
+
+    if strength_score < 2:
+        return
+
     quality = "⚡ FAST"
 
-    if trend_up and rsi < 60:
+    if strength_score == 3:
         quality = "🔥 STRONG"
-    elif trend_down and rsi > 40:
+    elif strength_score == 2:
         quality = "⚡ MEDIUM"
     else:
         quality = "⚠ SCALP"
@@ -211,6 +230,7 @@ def authorize():
 # ===============================
 def startFetching():
     for symbol in symbols:
+        # 1 MIN (your main logic)
         ws.send(json.dumps({
             "ticks_history": symbol,
             "style": "candles",
@@ -218,6 +238,15 @@ def startFetching():
             "count": 100
         }))
 
+        # 🔥 5 MIN (HIGHER TF CONFIRMATION)
+        ws.send(json.dumps({
+            "ticks_history": symbol,
+            "style": "candles",
+            "granularity": 300,
+            "count": 50
+        }))
+
+    # FAST TICKS
     for symbol in symbols:
         ws.send(json.dumps({
             "ticks": symbol,
@@ -230,20 +259,29 @@ def startFetching():
 def analyzeMarket(data):
     candles = data.get("candles", [])
     symbol = data.get("echo_req", {}).get("ticks_history")
+    granularity = data.get("echo_req", {}).get("granularity")
 
     if not candles or len(candles) < 20:
         return
-
-    last = candles[-1]
-    prev = candles[-2]
-
-    close = float(last["close"])
 
     highs = [float(c["high"]) for c in candles[-10:]]
     lows = [float(c["low"]) for c in candles[-10:]]
 
     uptrend = highs[-1] > highs[0] and lows[-1] > lows[0]
     downtrend = highs[-1] < highs[0] and lows[-1] < lows[0]
+
+    trend = "UPTREND" if uptrend else "DOWNTREND" if downtrend else "RANGE"
+
+    # 🔥 STORE HIGHER TIMEFRAME
+    if granularity == 300:
+        mtf_data[symbol] = {"trend": trend}
+        return
+
+    # ===== ORIGINAL LOGIC CONTINUES =====
+    last = candles[-1]
+    prev = candles[-2]
+
+    close = float(last["close"])
 
     bos = last["high"] > prev["high"] or last["low"] < prev["low"]
 
@@ -295,7 +333,7 @@ def analyzeMarket(data):
             "entry": entry,
             "sl": sl,
             "tp": tp,
-            "trend": "UPTREND" if uptrend else "DOWNTREND"
+            "trend": trend
         }
 
         signals_log.append(result)
