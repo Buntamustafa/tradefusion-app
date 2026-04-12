@@ -1,253 +1,202 @@
-// ===============================
-// 🔐 DERIV CONNECTION
-// ===============================
-const API_TOKEN = "pat_e7824954e7059f0eaf5adda6be29c4f468e349e9027e1b23a5b93d5aa9803d58";
-const WS_URL = "wss://ws.derivws.com/websockets/v3?app_id=1089";
+# ===============================
+# 🔐 DERIV CONNECTION
+# ===============================
+import websocket
+import json
+import threading
+import time
 
-let ws;
+API_TOKEN = "pat_4f3bb0455ca7efe76bd34d5f18e7e2a44b62d697e906dbf4f9dffb4215cd18e0"  # 🔥 INSERT HERE
+WS_URL = "wss://ws.derivws.com/websockets/v3?app_id=1089"
 
-// ===============================
-// 📊 PAIRS
-// ===============================
-const symbols = [
-  "frxEURUSD",
-  "frxXAUUSD",
-  "frxUSOIL",
-  "cryBTCUSD",
-  "cryETHUSD"
-];
+ws = None
 
-// ===============================
-// 🔊 SOUND ALERT
-// ===============================
-function playSound() {
-  const audio = new Audio("https://www.soundjay.com/buttons/sounds/beep-01a.mp3");
-  audio.play();
-}
+# ===============================
+# 📊 PAIRS (YOU REQUESTED)
+# ===============================
+symbols = [
+    "frxEURUSD",  # EUR/USD
+    "frxXAUUSD",  # GOLD
+    "frxUSOIL",   # OIL
+    "cryBTCUSD",  # BTC
+    "cryETHUSD"   # ETH
+]
 
-// ===============================
-// 🧠 STATE CONTROL
-// ===============================
-const lastSignalTime = {};
+# ===============================
+# 🔊 SOUND ALERT (SAFE FOR SERVER)
+# ===============================
+def playSound():
+    print("🔊 Beep!")  # Server-safe (no audio crash)
 
-// ===============================
-// 🔌 CONNECT
-// ===============================
-function connect() {
-  ws = new WebSocket(WS_URL);
+# ===============================
+# 🔌 CONNECT TO DERIV
+# ===============================
+def connect():
+    global ws
+    ws = websocket.WebSocketApp(
+        WS_URL,
+        on_open=on_open,
+        on_message=on_message,
+        on_error=on_error
+    )
+    ws.run_forever()
 
-  ws.onopen = () => {
-    console.log("✅ Connected");
-    authorize();
-  };
+def on_open(ws):
+    print("✅ Connected to Deriv")
+    authorize()
 
-  ws.onmessage = (msg) => {
-    const data = JSON.parse(msg.data);
+def on_message(ws, message):
+    data = json.loads(message)
 
-    if (data.msg_type === "authorize") {
-      console.log("🔐 Authorized");
-      startFetching();
-      setInterval(startFetching, 60000);
-    }
+    if data.get("msg_type") == "authorize":
+        print("🔐 Authorized")
+        startFetching()
 
-    if (data.msg_type === "candles") {
-      analyzeMarket(data);
-    }
-  };
+    if data.get("msg_type") == "candles":
+        analyzeMarket(data)
 
-  ws.onerror = (err) => console.log("❌ Error:", err);
+def on_error(ws, error):
+    print("❌ Error:", error)
 
-  ws.onclose = () => {
-    console.log("🔄 Reconnecting...");
-    setTimeout(connect, 3000);
-  };
-}
+# ===============================
+# 🔐 AUTHORIZE
+# ===============================
+def authorize():
+    ws.send(json.dumps({
+        "authorize": API_TOKEN
+    }))
 
-// ===============================
-// 🔐 AUTHORIZE
-// ===============================
-function authorize() {
-  ws.send(JSON.stringify({
-    authorize: API_TOKEN
-  }));
-}
+# ===============================
+# 📡 FETCH DATA (1m candles)
+# ===============================
+def startFetching():
+    for symbol in symbols:
+        ws.send(json.dumps({
+            "ticks_history": symbol,
+            "style": "candles",
+            "granularity": 60,
+            "count": 100
+        }))
 
-// ===============================
-// 📡 FETCH DATA
-// ===============================
-function startFetching() {
-  symbols.forEach(symbol => {
-    ws.send(JSON.stringify({
-      ticks_history: symbol,
-      style: "candles",
-      granularity: 60,
-      count: 100,
-      end: "latest"
-    }));
-  });
-}
+# ===============================
+# 🧠 MARKET ANALYSIS CORE
+# ===============================
+def analyzeMarket(data):
+    candles = data.get("candles", [])
+    symbol = data.get("echo_req", {}).get("ticks_history")
 
-// ===============================
-// 🧠 MARKET ANALYSIS
-// ===============================
-function analyzeMarket(data) {
-  const candles = data.candles;
-  const symbol = data.echo_req.ticks_history;
+    if not candles or len(candles) < 20:
+        return
 
-  if (!candles || candles.length < 20) return;
+    last = candles[-1]
+    prev = candles[-2]
 
-  const c1 = candles[candles.length - 3];
-  const c2 = candles[candles.length - 2];
-  const c3 = candles[candles.length - 1];
+    high = float(last["high"])
+    low = float(last["low"])
+    close = float(last["close"])
 
-  // ===============================
-  // 🧩 ORIGINAL LOGIC (UNCHANGED)
-  // ===============================
-  let bosUp = c3.high > c2.high && c2.high > c1.high;
-  let bosDown = c3.low < c2.low && c2.low < c1.low;
-  let bos = bosUp || bosDown;
+    # ===============================
+    # 📈 TREND STRUCTURE (NEW)
+    # ===============================
+    highs = [float(c["high"]) for c in candles[-10:]]
+    lows = [float(c["low"]) for c in candles[-10:]]
 
-  let sweepUp = c3.high > c2.high && c3.close < c2.high;
-  let sweepDown = c3.low < c2.low && c3.close > c2.low;
-  let sweep = sweepUp || sweepDown;
+    uptrend = highs[-1] > highs[0] and lows[-1] > lows[0]
+    downtrend = highs[-1] < highs[0] and lows[-1] < lows[0]
 
-  let fvgUp = c1.high < c3.low;
-  let fvgDown = c1.low > c3.high;
-  let fvg = fvgUp || fvgDown;
+    # ===============================
+    # 🧩 BOS (Break of Structure)
+    # ===============================
+    bos = last["high"] > prev["high"] or last["low"] < prev["low"]
 
-  // ===============================
-  // 🧠 NEW: SWING DETECTION
-  // ===============================
-  let swingHigh = null;
-  let swingLow = null;
+    # ===============================
+    # 💧 LIQUIDITY SWEEP
+    # ===============================
+    sweep = False
+    if last["high"] > prev["high"] and close < prev["high"]:
+        sweep = True
+    if last["low"] < prev["low"] and close > prev["low"]:
+        sweep = True
 
-  for (let i = candles.length - 10; i < candles.length - 2; i++) {
-    if (
-      candles[i].high > candles[i - 1].high &&
-      candles[i].high > candles[i + 1].high
-    ) {
-      swingHigh = candles[i].high;
-    }
+    # ===============================
+    # ⚡ MINI FVG
+    # ===============================
+    fvg = False
+    c1 = candles[-3]
+    c3 = candles[-1]
 
-    if (
-      candles[i].low < candles[i - 1].low &&
-      candles[i].low < candles[i + 1].low
-    ) {
-      swingLow = candles[i].low;
-    }
-  }
+    if float(c1["high"]) < float(c3["low"]) or float(c1["low"]) > float(c3["high"]):
+        fvg = True
 
-  // ===============================
-  // 🧩 STRONG BOS (SWING BASED)
-  // ===============================
-  let strongBosUp = swingHigh && c3.close > swingHigh;
-  let strongBosDown = swingLow && c3.close < swingLow;
+    # ===============================
+    # 🧱 SUPPORT / RESISTANCE
+    # ===============================
+    resistance = max(highs)
+    support = min(lows)
 
-  // ===============================
-  // 📈 TREND STRUCTURE
-  // ===============================
-  let trend = "RANGE";
+    # ===============================
+    # 🎯 ENTRY + SL + TP
+    # ===============================
+    entry = close
+    sl = None
+    tp = None
+    direction = None
 
-  if (strongBosUp) trend = "UPTREND";
-  else if (strongBosDown) trend = "DOWNTREND";
+    if uptrend:
+        direction = "BUY"
+        sl = support
+        tp = entry + (entry - sl) * 2
 
-  // ===============================
-  // 🎯 DIRECTION FILTER
-  // ===============================
-  let direction = null;
+    elif downtrend:
+        direction = "SELL"
+        sl = resistance
+        tp = entry - (sl - entry) * 2
 
-  if (trend === "UPTREND" && (sweepUp || fvgUp)) {
-    direction = "BUY";
-  }
+    # ===============================
+    # 🎯 SIGNAL QUALITY
+    # ===============================
+    signal = None
+    quality = "⚠ SCALP"
 
-  if (trend === "DOWNTREND" && (sweepDown || fvgDown)) {
-    direction = "SELL";
-  }
+    if bos and sweep and fvg and (uptrend or downtrend):
+        signal = "SNIPER ENTRY 🎯"
+        quality = "🔥 STRONG"
 
-  // ===============================
-  // 🎯 SIGNAL + QUALITY
-  // ===============================
-  let signal = null;
-  let quality = "";
+    elif bos and (sweep or fvg):
+        signal = "ENTRY ⚡"
+        quality = "⚡ MEDIUM"
 
-  if (trend !== "RANGE" && strongBosUp && sweep && fvg) {
-    signal = "SNIPER ENTRY 🎯";
-    quality = "🔥 STRONG";
-  } 
-  else if (trend !== "RANGE" && bos && (sweep || fvg)) {
-    signal = "ENTRY ⚡";
-    quality = "⚡ MEDIUM";
-  } 
-  else {
-    signal = "SCALP ⚠";
-    quality = "⚠ SCALP (RANGE)";
-  }
+    elif bos:
+        signal = "QUICK SCALP ⚠"
+        quality = "⚠ SCALP"
 
-  // ===============================
-  // 📊 ENTRY / SL / TP
-  // ===============================
-  let entry = null;
-  let sl = null;
-  let tp = null;
-
-  if (direction) {
-    entry = c3.close;
-
-    if (direction === "BUY") {
-      sl = swingLow || Math.min(c1.low, c2.low, c3.low);
-      let risk = entry - sl;
-      tp = entry + (risk * 2);
-    }
-
-    if (direction === "SELL") {
-      sl = swingHigh || Math.max(c1.high, c2.high, c3.high);
-      let risk = sl - entry;
-      tp = entry - (risk * 2);
-    }
-  }
-
-  // ===============================
-  // ⏱ ANTI-SPAM
-  // ===============================
-  const now = Date.now();
-  if (lastSignalTime[symbol] && now - lastSignalTime[symbol] < 60000) {
-    return;
-  }
-
-  // ===============================
-  // 📢 OUTPUT
-  // ===============================
-  if (direction) {
-    lastSignalTime[symbol] = now;
-
-    console.log(`
+    # ===============================
+    # 📢 OUTPUT
+    # ===============================
+    if signal:
+        print(f"""
 ==============================
-📊 ${symbol}
-${signal}
-Quality: ${quality}
+📊 {symbol}
+Direction: {direction}
+{signal}
+Quality: {quality}
 
-📈 Trend: ${trend}
-📍 Direction: ${direction}
+📍 Entry: {entry}
+🛑 Stop Loss: {sl}
+🎯 Take Profit: {tp}
 
-🎯 Entry: ${entry}
-🛑 Stop Loss: ${sl}
-💰 Take Profit: ${tp}
+📈 Trend: {"UPTREND" if uptrend else "DOWNTREND" if downtrend else "RANGE"}
 
-✔ BOS: ${bos ? "✅" : "❌"}
-✔ Strong BOS: ${(strongBosUp || strongBosDown) ? "✅" : "❌"}
-✔ Sweep: ${sweep ? "✅" : "❌"}
-✔ FVG: ${fvg ? "✅" : "❌"}
-
-📌 Resistance: ${swingHigh || "N/A"}
-📌 Support: ${swingLow || "N/A"}
+✔ BOS: {"✅" if bos else "❌"}
+✔ Sweep: {"✅" if sweep else "❌"}
+✔ FVG: {"✅" if fvg else "❌"}
 ==============================
-    `);
+        """)
 
-    playSound();
-  }
-}
+        playSound()
 
-// ===============================
-// 🚀 START
-// ===============================
-connect();
+# ===============================
+# 🚀 START BOT
+# ===============================
+if __name__ == "__main__":
+    connect()
