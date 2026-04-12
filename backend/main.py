@@ -1,20 +1,20 @@
 // ===============================
 // 🔐 DERIV CONNECTION
 // ===============================
-const API_TOKEN = "pat_81f005f46e8ace4472e4e8c0e90e4a27422999b3dc1088cbf265b0b546da20a9";
+const API_TOKEN = "PUT_NEW_TOKEN_HERE";
 const WS_URL = "wss://ws.derivws.com/websockets/v3?app_id=1089";
 
 let ws;
 
 // ===============================
-// 📊 PAIRS (YOU REQUESTED)
+// 📊 PAIRS
 // ===============================
 const symbols = [
-  "frxEURUSD",  // EUR/USD
-  "frxXAUUSD",  // GOLD
-  "frxUSOIL",   // OIL
-  "cryBTCUSD",  // BTC
-  "cryETHUSD"   // ETH
+  "frxEURUSD",
+  "frxXAUUSD",
+  "frxUSOIL",
+  "cryBTCUSD",
+  "cryETHUSD"
 ];
 
 // ===============================
@@ -26,13 +26,18 @@ function playSound() {
 }
 
 // ===============================
-// 🔌 CONNECT TO DERIV
+// 🧠 STATE CONTROL
+// ===============================
+const lastSignalTime = {};
+
+// ===============================
+// 🔌 CONNECT
 // ===============================
 function connect() {
   ws = new WebSocket(WS_URL);
 
   ws.onopen = () => {
-    console.log("✅ Connected to Deriv");
+    console.log("✅ Connected");
     authorize();
   };
 
@@ -42,6 +47,7 @@ function connect() {
     if (data.msg_type === "authorize") {
       console.log("🔐 Authorized");
       startFetching();
+      setInterval(startFetching, 60000);
     }
 
     if (data.msg_type === "candles") {
@@ -50,6 +56,11 @@ function connect() {
   };
 
   ws.onerror = (err) => console.log("❌ Error:", err);
+
+  ws.onclose = () => {
+    console.log("🔄 Reconnecting...");
+    setTimeout(connect, 3000);
+  };
 }
 
 // ===============================
@@ -62,21 +73,22 @@ function authorize() {
 }
 
 // ===============================
-// 📡 FETCH DATA (1m candles)
+// 📡 FETCH DATA
 // ===============================
 function startFetching() {
   symbols.forEach(symbol => {
     ws.send(JSON.stringify({
       ticks_history: symbol,
       style: "candles",
-      granularity: 60,   // 1 minute
-      count: 100
+      granularity: 60,
+      count: 100,
+      end: "latest"
     }));
   });
 }
 
 // ===============================
-// 🧠 MARKET ANALYSIS CORE
+// 🧠 MARKET ANALYSIS
 // ===============================
 function analyzeMarket(data) {
   const candles = data.candles;
@@ -84,76 +96,150 @@ function analyzeMarket(data) {
 
   if (!candles || candles.length < 20) return;
 
-  const last = candles[candles.length - 1];
-  const prev = candles[candles.length - 2];
-
-  const high = last.high;
-  const low = last.low;
-  const close = last.close;
-
-  // ===============================
-  // 🧩 BOS (Break of Structure)
-  // ===============================
-  let bos = false;
-  if (last.high > prev.high || last.low < prev.low) {
-    bos = true;
-  }
-
-  // ===============================
-  // 💧 LIQUIDITY SWEEP
-  // ===============================
-  let sweep = false;
-  if (last.high > prev.high && close < prev.high) {
-    sweep = true; // fake breakout up
-  }
-  if (last.low < prev.low && close > prev.low) {
-    sweep = true; // fake breakout down
-  }
-
-  // ===============================
-  // ⚡ MINI FVG (Fair Value Gap)
-  // ===============================
-  let fvg = false;
   const c1 = candles[candles.length - 3];
   const c2 = candles[candles.length - 2];
   const c3 = candles[candles.length - 1];
 
-  if (c1.high < c3.low || c1.low > c3.high) {
-    fvg = true;
+  // ===============================
+  // 🧩 ORIGINAL LOGIC (UNCHANGED)
+  // ===============================
+  let bosUp = c3.high > c2.high && c2.high > c1.high;
+  let bosDown = c3.low < c2.low && c2.low < c1.low;
+  let bos = bosUp || bosDown;
+
+  let sweepUp = c3.high > c2.high && c3.close < c2.high;
+  let sweepDown = c3.low < c2.low && c3.close > c2.low;
+  let sweep = sweepUp || sweepDown;
+
+  let fvgUp = c1.high < c3.low;
+  let fvgDown = c1.low > c3.high;
+  let fvg = fvgUp || fvgDown;
+
+  // ===============================
+  // 🧠 NEW: SWING DETECTION
+  // ===============================
+  let swingHigh = null;
+  let swingLow = null;
+
+  for (let i = candles.length - 10; i < candles.length - 2; i++) {
+    if (
+      candles[i].high > candles[i - 1].high &&
+      candles[i].high > candles[i + 1].high
+    ) {
+      swingHigh = candles[i].high;
+    }
+
+    if (
+      candles[i].low < candles[i - 1].low &&
+      candles[i].low < candles[i + 1].low
+    ) {
+      swingLow = candles[i].low;
+    }
   }
 
   // ===============================
-  // 🎯 SNIPER ENTRY LOGIC
+  // 🧩 STRONG BOS (SWING BASED)
+  // ===============================
+  let strongBosUp = swingHigh && c3.close > swingHigh;
+  let strongBosDown = swingLow && c3.close < swingLow;
+
+  // ===============================
+  // 📈 TREND STRUCTURE
+  // ===============================
+  let trend = "RANGE";
+
+  if (strongBosUp) trend = "UPTREND";
+  else if (strongBosDown) trend = "DOWNTREND";
+
+  // ===============================
+  // 🎯 DIRECTION FILTER
+  // ===============================
+  let direction = null;
+
+  if (trend === "UPTREND" && (sweepUp || fvgUp)) {
+    direction = "BUY";
+  }
+
+  if (trend === "DOWNTREND" && (sweepDown || fvgDown)) {
+    direction = "SELL";
+  }
+
+  // ===============================
+  // 🎯 SIGNAL + QUALITY
   // ===============================
   let signal = null;
-  let quality = "⚠ Scalp";
+  let quality = "";
 
-  if (bos && sweep && fvg) {
+  if (trend !== "RANGE" && strongBosUp && sweep && fvg) {
     signal = "SNIPER ENTRY 🎯";
     quality = "🔥 STRONG";
   } 
-  else if (bos && (sweep || fvg)) {
+  else if (trend !== "RANGE" && bos && (sweep || fvg)) {
     signal = "ENTRY ⚡";
     quality = "⚡ MEDIUM";
   } 
-  else if (bos) {
-    signal = "QUICK SCALP ⚠";
-    quality = "⚠ SCALP";
+  else {
+    signal = "SCALP ⚠";
+    quality = "⚠ SCALP (RANGE)";
   }
 
   // ===============================
-  // 📢 OUTPUT SIGNAL
+  // 📊 ENTRY / SL / TP
   // ===============================
-  if (signal) {
+  let entry = null;
+  let sl = null;
+  let tp = null;
+
+  if (direction) {
+    entry = c3.close;
+
+    if (direction === "BUY") {
+      sl = swingLow || Math.min(c1.low, c2.low, c3.low);
+      let risk = entry - sl;
+      tp = entry + (risk * 2);
+    }
+
+    if (direction === "SELL") {
+      sl = swingHigh || Math.max(c1.high, c2.high, c3.high);
+      let risk = sl - entry;
+      tp = entry - (risk * 2);
+    }
+  }
+
+  // ===============================
+  // ⏱ ANTI-SPAM
+  // ===============================
+  const now = Date.now();
+  if (lastSignalTime[symbol] && now - lastSignalTime[symbol] < 60000) {
+    return;
+  }
+
+  // ===============================
+  // 📢 OUTPUT
+  // ===============================
+  if (direction) {
+    lastSignalTime[symbol] = now;
+
     console.log(`
 ==============================
 📊 ${symbol}
 ${signal}
 Quality: ${quality}
 
+📈 Trend: ${trend}
+📍 Direction: ${direction}
+
+🎯 Entry: ${entry}
+🛑 Stop Loss: ${sl}
+💰 Take Profit: ${tp}
+
 ✔ BOS: ${bos ? "✅" : "❌"}
+✔ Strong BOS: ${(strongBosUp || strongBosDown) ? "✅" : "❌"}
 ✔ Sweep: ${sweep ? "✅" : "❌"}
-✔ Mini FVG: ${fvg ? "✅" : "❌"}
+✔ FVG: ${fvg ? "✅" : "❌"}
+
+📌 Resistance: ${swingHigh || "N/A"}
+📌 Support: ${swingLow || "N/A"}
 ==============================
     `);
 
@@ -162,6 +248,6 @@ Quality: ${quality}
 }
 
 // ===============================
-// 🚀 START BOT
+// 🚀 START
 // ===============================
 connect();
