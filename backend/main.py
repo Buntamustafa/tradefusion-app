@@ -1,24 +1,18 @@
-from flask import Flask, render_template_string, jsonify
+from flask import Flask, jsonify, render_template_string
 import requests, time, threading
 import pandas as pd
+import numpy as np
 
 app = Flask(__name__)
-
-TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"
-CHAT_ID = "YOUR_CHAT_ID"
-
 signals = []
 
 PAIRS = ["BTCUSDT", "ETHUSDT"]
 
-# 🔔 TELEGRAM
-def send_telegram(msg):
-    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-    requests.post(url, data={"chat_id": CHAT_ID, "text": msg})
-
-# 📊 DATA
+# =========================
+# 📊 GET DATA
+# =========================
 def get_data(symbol, interval="15m"):
-    url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit=100"
+    url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit=200"
     data = requests.get(url).json()
     df = pd.DataFrame(data)
     df.columns = ["time","o","h","l","c","v","ct","qv","n","tbb","tbq","ig"]
@@ -28,7 +22,9 @@ def get_data(symbol, interval="15m"):
     df["o"] = df["o"].astype(float)
     return df
 
+# =========================
 # 📈 RSI
+# =========================
 def rsi(df, period=14):
     delta = df["c"].diff()
     gain = delta.clip(lower=0).rolling(period).mean()
@@ -36,18 +32,37 @@ def rsi(df, period=14):
     rs = gain / loss
     return 100 - (100 / (1 + rs))
 
-# 💧 LIQUIDITY SWEEP
-def liquidity_sweep(df):
-    prev_high = df["h"].iloc[-5:-1].max()
-    prev_low = df["l"].iloc[-5:-1].min()
+# =========================
+# 💥 VOLATILITY FILTER (ATR)
+# =========================
+def atr(df, period=14):
+    df["tr"] = np.maximum(df["h"] - df["l"], 
+                np.maximum(abs(df["h"] - df["c"].shift()), abs(df["l"] - df["c"].shift())))
+    return df["tr"].rolling(period).mean()
 
-    if df["h"].iloc[-1] > prev_high and df["c"].iloc[-1] < prev_high:
+# =========================
+# 🔥 BOS
+# =========================
+def bos(df):
+    if df["h"].iloc[-1] > df["h"].iloc[-5:-1].max():
+        return "BUY"
+    if df["l"].iloc[-1] < df["l"].iloc[-5:-1].min():
         return "SELL"
-    if df["l"].iloc[-1] < prev_low and df["c"].iloc[-1] > prev_low:
+    return None
+
+# =========================
+# 💧 LIQUIDITY SWEEP
+# =========================
+def sweep(df):
+    if df["h"].iloc[-1] > df["h"].iloc[-5:-1].max() and df["c"].iloc[-1] < df["h"].iloc[-5:-1].max():
+        return "SELL"
+    if df["l"].iloc[-1] < df["l"].iloc[-5:-1].min() and df["c"].iloc[-1] > df["l"].iloc[-5:-1].min():
         return "BUY"
     return None
 
+# =========================
 # 🧠 ORDER BLOCK
+# =========================
 def order_block(df):
     if df["c"].iloc[-3] < df["o"].iloc[-3] and df["c"].iloc[-1] > df["h"].iloc[-3]:
         return "BUY"
@@ -55,107 +70,143 @@ def order_block(df):
         return "SELL"
     return None
 
-# 📍 ZONE
+# =========================
+# ⚡ FVG
+# =========================
+def fvg(df):
+    if df["l"].iloc[-2] > df["h"].iloc[-4]:
+        return "BUY"
+    if df["h"].iloc[-2] < df["l"].iloc[-4]:
+        return "SELL"
+    return None
+
+# =========================
+# 🧱 ADVANCED LIQUIDITY ZONES
+# =========================
 def liquidity_zone(df):
-    high = df["h"].rolling(10).max().iloc[-1]
-    low = df["l"].rolling(10).min().iloc[-1]
+    high = df["h"].rolling(50).max().iloc[-1]
+    low = df["l"].rolling(50).min().iloc[-1]
     price = df["c"].iloc[-1]
 
-    if price >= high * 0.995:
-        return "HIGH_ZONE"
-    if price <= low * 1.005:
-        return "LOW_ZONE"
+    if price > high * 0.995:
+        return "SELL_ZONE"
+    elif price < low * 1.005:
+        return "BUY_ZONE"
     return "MID"
 
-# 🚨 NEWS / VOLATILITY DETECTOR
-def high_volatility(df):
-    candle = abs(df["c"].iloc[-1] - df["o"].iloc[-1])
-    avg = (df["h"] - df["l"]).rolling(10).mean().iloc[-1]
-    return candle > avg * 1.5
+# =========================
+# 📉 TREND (1H)
+# =========================
+def trend(df):
+    return "UP" if df["c"].iloc[-1] > df["c"].iloc[-20] else "DOWN"
 
-# 🧠 SIGNAL LOGIC
+# =========================
+# 🌍 SESSION FILTER
+# =========================
+def session():
+    hour = int(time.strftime("%H"))
+    if 7 <= hour <= 16:
+        return "LONDON"
+    elif 13 <= hour <= 22:
+        return "NEWYORK"
+    return "ASIA"
+
+# =========================
+# 📰 NEWS SMART FILTER
+# =========================
+def news_filter(df):
+    current_atr = atr(df).iloc[-1]
+    avg_atr = atr(df).rolling(50).mean().iloc[-1]
+
+    if current_atr > avg_atr * 1.5:
+        return "HIGH_IMPACT"
+    return "NORMAL"
+
+# =========================
+# 🎯 SIGNAL ENGINE
+# =========================
 def generate_signal(pair):
-    df_15m = get_data(pair, "15m")
-    df_1h = get_data(pair, "1h")
+    df15 = get_data(pair, "15m")
+    df1h = get_data(pair, "1h")
+    df1m = get_data(pair, "1m")
 
-    trend_up = df_1h["c"].iloc[-1] > df_1h["c"].iloc[-10]
+    confirmations = 0
+    direction = None
 
-    sweep = liquidity_sweep(df_15m)
-    ob = order_block(df_15m)
-    zone = liquidity_zone(df_15m)
-    rsi_val = rsi(df_15m).iloc[-1]
-    volatile = high_volatility(df_15m)
+    checks = [
+        sweep(df15),
+        order_block(df15),
+        bos(df15),
+        fvg(df15)
+    ]
 
-    signal_type = None
-    strength = "LOW"
+    for c in checks:
+        if c:
+            confirmations += 1
+            direction = c
 
-    # 🟣 STRONG (strict)
-    if trend_up and sweep == "BUY" and ob == "BUY" and zone == "LOW_ZONE" and rsi_val < 35:
-        signal_type = "BUY"
+    sniper = bos(df1m)
+    trend_dir = trend(df1h)
+    zone = liquidity_zone(df15)
+    market_session = session()
+    news = news_filter(df15)
+
+    # =========================
+    # 🎯 CLASSIFICATION
+    # =========================
+    strength = "SCALP"
+
+    if confirmations >= 4 and sniper == direction:
         strength = "STRONG"
-
-    elif not trend_up and sweep == "SELL" and ob == "SELL" and zone == "HIGH_ZONE" and rsi_val > 65:
-        signal_type = "SELL"
-        strength = "STRONG"
-
-    # 🔥 MEDIUM
-    elif sweep == ob and sweep is not None:
-        signal_type = sweep
+    elif confirmations >= 2:
         strength = "MEDIUM"
 
-    # ⚡ LOW
-    elif sweep:
-        signal_type = sweep
-        strength = "LOW"
+    # =========================
+    # 🚫 TREND FILTER
+    # =========================
+    if trend_dir == "UP" and direction == "SELL":
+        return
+    if trend_dir == "DOWN" and direction == "BUY":
+        return
 
-    # 🌀 SCALP (range)
-    elif zone == "MID":
-        if rsi_val < 40:
-            signal_type = "BUY"
-            strength = "SCALP"
-        elif rsi_val > 60:
-            signal_type = "SELL"
-            strength = "SCALP"
+    # =========================
+    # 🌍 SESSION ADJUSTMENT
+    # =========================
+    if market_session == "ASIA" and strength == "STRONG":
+        strength = "MEDIUM"
 
-    if signal_type:
-        price = df_15m["c"].iloc[-1]
+    # =========================
+    # 📰 NEWS ADJUSTMENT
+    # =========================
+    if news == "HIGH_IMPACT":
+        strength = "SCALP"
 
-        entry = round(price, 2)
+    if direction:
+        price = df15["c"].iloc[-1]
+        atr_val = atr(df15).iloc[-1]
 
-        if signal_type == "BUY":
-            sl = round(price - 100, 2)
-            tp = round(price + 200, 2)
-        else:
-            sl = round(price + 100, 2)
-            tp = round(price - 200, 2)
-
-        # 🚨 adjust for volatility (news)
-        if volatile:
-            tp = round(tp * 1.2, 2)
+        # =========================
+        # 💰 DYNAMIC RISK
+        # =========================
+        sl = round(price - atr_val, 2) if direction == "BUY" else round(price + atr_val, 2)
+        tp = round(price + atr_val * 2, 2) if direction == "BUY" else round(price - atr_val * 2, 2)
 
         signal = {
             "pair": pair,
-            "signal": signal_type,
+            "type": direction,
             "strength": strength,
-            "entry": entry,
+            "entry": round(price, 2),
             "sl": sl,
             "tp": tp,
+            "session": market_session,
             "time": time.strftime("%H:%M:%S")
         }
 
         signals.insert(0, signal)
 
-        msg = f"""
-📊 {pair} {signal_type}
-🔥 {strength}
-💰 Entry: {entry}
-🛑 SL: {sl}
-🎯 TP: {tp}
-⏰ {signal['time']}
-"""
-        send_telegram(msg)
-
+# =========================
 # 🔁 LOOP
+# =========================
 def bot_loop():
     while True:
         try:
@@ -165,20 +216,16 @@ def bot_loop():
             print(e)
         time.sleep(60)
 
+# =========================
 # 🌐 API
+# =========================
 @app.route("/api/signals")
-def api_signals():
-    return jsonify(signals)
+def api():
+    return jsonify(signals[:20])
 
-# 🌐 DASHBOARD
-@app.route("/dashboard")
-def dashboard():
-    return render_template_string("<h2>Running...</h2>")
-
-@app.route("/")
-def home():
-    return "Bot running ✅"
-
+# =========================
+# 🚀 START
+# =========================
 threading.Thread(target=bot_loop).start()
 
 if __name__ == "__main__":
