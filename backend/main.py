@@ -19,7 +19,7 @@ ws = None
 app = Flask(__name__)
 
 # ===============================
-# 📊 SIGNAL STORAGE
+# 📊 STORAGE
 # ===============================
 signals_log = []
 tick_prices = {}
@@ -36,7 +36,7 @@ symbols = [
 ]
 
 # ===============================
-# 🔊 SOUND ALERT
+# 🔊 SOUND
 # ===============================
 def playSound():
     print("🔊 SIGNAL ALERT!")
@@ -49,7 +49,6 @@ def calculate_rsi(prices, period=14):
         return None
 
     gains, losses = [], []
-
     for i in range(1, len(prices)):
         diff = prices[i] - prices[i - 1]
         if diff > 0:
@@ -80,7 +79,26 @@ def calculate_ema(prices, period):
     return ema
 
 # ===============================
-# ⚡ FAST SIGNAL ENGINE (AI)
+# 🧠 SIGNAL STRENGTH ENGINE
+# ===============================
+def calculate_strength(bos, sweep, fvg, trend, ema_align):
+    score = 0
+
+    if bos:
+        score += 25
+    if sweep:
+        score += 25
+    if fvg:
+        score += 20
+    if trend:
+        score += 15
+    if ema_align:
+        score += 15
+
+    return score
+
+# ===============================
+# ⚡ FAST SIGNAL (AI)
 # ===============================
 def fastSignal(data):
     if "tick" not in data:
@@ -109,35 +127,27 @@ def fastSignal(data):
     if rsi is None or ema9 is None or ema21 is None:
         return
 
-    momentum_up = prices[-1] > prices[-5]
-    momentum_down = prices[-1] < prices[-5]
-
     trend_up = ema9 > ema21
     trend_down = ema9 < ema21
 
-    valid_buy = momentum_up and trend_up and rsi < 70
-    valid_sell = momentum_down and trend_down and rsi > 30
+    valid_buy = trend_up and rsi < 70
+    valid_sell = trend_down and rsi > 30
 
     if not (valid_buy or valid_sell):
         return
 
-    # QUALITY CLASS
-    quality = "⚡ FAST"
+    # strength for fast
+    strength = 60
     if trend_up and rsi < 60:
-        quality = "🔥 STRONG"
-    elif trend_down and rsi > 40:
-        quality = "⚡ MEDIUM"
-    else:
-        quality = "⚠ SCALP"
+        strength = 80
 
     result = {
         "symbol": symbol,
         "direction": "BUY" if valid_buy else "SELL",
         "signal": "⚡ FAST AI SIGNAL",
-        "quality": quality,
+        "quality": "⚡ FAST",
+        "strength": f"{strength}%",
         "entry": price,
-        "sl": None,
-        "tp": None,
         "trend": "UPTREND" if trend_up else "DOWNTREND"
     }
 
@@ -145,11 +155,11 @@ def fastSignal(data):
     if len(signals_log) > 50:
         signals_log.pop(0)
 
-    print("🧠 AI SIGNAL:", result)
+    print("🧠 FAST SIGNAL:", result)
     playSound()
 
 # ===============================
-# 🔌 CONNECT TO DERIV
+# 🔌 CONNECTION
 # ===============================
 def connect():
     global ws
@@ -158,18 +168,15 @@ def connect():
             ws = WebSocketApp(
                 WS_URL,
                 on_open=on_open,
-                on_message=on_message,
-                on_error=on_error,
-                on_close=on_close
+                on_message=on_message
             )
             ws.run_forever()
-        except Exception as e:
-            print("Reconnect error:", e)
+        except:
             time.sleep(5)
 
 def on_open(ws):
-    print("✅ Connected to Deriv")
-    authorize()
+    print("✅ Connected")
+    ws.send(json.dumps({"authorize": API_TOKEN}))
 
 def on_message(ws, message):
     data = json.loads(message)
@@ -184,50 +191,30 @@ def on_message(ws, message):
     if data.get("msg_type") == "tick":
         fastSignal(data)
 
-def on_error(ws, error):
-    print("❌ Error:", error)
-
-def on_close(ws, close_status_code, close_msg):
-    print("🔌 Connection closed, retrying...")
-
 # ===============================
-# 🔐 AUTHORIZE
-# ===============================
-def authorize():
-    if not API_TOKEN:
-        print("❌ API TOKEN NOT FOUND!")
-        return
-
-    ws.send(json.dumps({
-        "authorize": API_TOKEN
-    }))
-
-# ===============================
-# 📡 FETCH DATA
+# 📡 FETCH
 # ===============================
 def startFetching():
-    for symbol in symbols:
+    for s in symbols:
         ws.send(json.dumps({
-            "ticks_history": symbol,
+            "ticks_history": s,
             "style": "candles",
             "granularity": 60,
             "count": 100
         }))
-
-    for symbol in symbols:
         ws.send(json.dumps({
-            "ticks": symbol,
+            "ticks": s,
             "subscribe": 1
         }))
 
 # ===============================
-# 🧠 MARKET ANALYSIS
+# 🧠 MAIN ANALYSIS
 # ===============================
 def analyzeMarket(data):
     candles = data.get("candles", [])
     symbol = data.get("echo_req", {}).get("ticks_history")
 
-    if not candles or len(candles) < 20:
+    if len(candles) < 20:
         return
 
     last = candles[-1]
@@ -238,8 +225,8 @@ def analyzeMarket(data):
     highs = [float(c["high"]) for c in candles[-10:]]
     lows = [float(c["low"]) for c in candles[-10:]]
 
-    uptrend = highs[-1] > highs[0] and lows[-1] > lows[0]
-    downtrend = highs[-1] < highs[0] and lows[-1] < lows[0]
+    uptrend = highs[-1] > highs[0]
+    downtrend = highs[-1] < highs[0]
 
     bos = last["high"] > prev["high"] or last["low"] < prev["low"]
 
@@ -253,53 +240,38 @@ def analyzeMarket(data):
         float(candles[-3]["low"]) > float(last["high"])
     )
 
-    resistance = max(highs)
-    support = min(lows)
+    prices = [float(c["close"]) for c in candles]
+    ema9 = calculate_ema(prices, 9)
+    ema21 = calculate_ema(prices, 21)
 
-    direction = None
-    entry = close
-    sl = None
-    tp = None
+    ema_align = ema9 and ema21 and ((ema9 > ema21) or (ema9 < ema21))
 
-    if uptrend:
-        direction = "BUY"
-        sl = support
-        tp = entry + (entry - sl) * 2
-    elif downtrend:
-        direction = "SELL"
-        sl = resistance
-        tp = entry - (sl - entry) * 2
+    strength_score = calculate_strength(bos, sweep, fvg, (uptrend or downtrend), ema_align)
 
-    signal = None
-    quality = "⚠ SCALP"
-
-    if bos and sweep and fvg:
-        signal = "SNIPER ENTRY 🎯"
+    # QUALITY CLASS
+    if strength_score >= 80:
         quality = "🔥 STRONG"
-    elif bos and (sweep or fvg):
-        signal = "ENTRY ⚡"
+    elif strength_score >= 60:
         quality = "⚡ MEDIUM"
-    elif bos:
-        signal = "QUICK SCALP ⚠"
+    else:
+        quality = "⚠ SCALP"
 
-    if signal:
-        result = {
-            "symbol": symbol,
-            "direction": direction,
-            "signal": signal,
-            "quality": quality,
-            "entry": entry,
-            "sl": sl,
-            "tp": tp,
-            "trend": "UPTREND" if uptrend else "DOWNTREND"
-        }
+    result = {
+        "symbol": symbol,
+        "direction": "BUY" if uptrend else "SELL",
+        "signal": "SMART ENTRY",
+        "quality": quality,
+        "strength": f"{strength_score}%",
+        "entry": close,
+        "trend": "UPTREND" if uptrend else "DOWNTREND"
+    }
 
-        signals_log.append(result)
-        if len(signals_log) > 50:
-            signals_log.pop(0)
+    signals_log.append(result)
+    if len(signals_log) > 50:
+        signals_log.pop(0)
 
-        print(result)
-        playSound()
+    print("📊 SIGNAL:", result)
+    playSound()
 
 # ===============================
 # 🌐 DASHBOARD
@@ -307,26 +279,18 @@ def analyzeMarket(data):
 @app.route("/")
 def dashboard():
     if not signals_log:
-        return "<h2 style='color:white;background:#0f172a;padding:20px'>⏳ Waiting for signals...</h2>"
+        return "<h2>⏳ Waiting for signals...</h2>"
     return jsonify(signals_log[::-1])
 
 @app.route("/signals")
-def get_signals():
+def signals():
     return jsonify(signals_log)
 
 # ===============================
-# 🚀 START BOT
+# 🚀 START
 # ===============================
-def start_bot():
-    thread = threading.Thread(target=connect)
-    thread.daemon = True
-    thread.start()
+threading.Thread(target=connect, daemon=True).start()
 
-start_bot()
-
-# ===============================
-# 🚀 RUN FLASK
-# ===============================
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
+    port = int(os.getenv("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
