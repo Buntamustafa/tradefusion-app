@@ -8,7 +8,9 @@ import time
 import os
 from flask import Flask, jsonify
 
+# ✅ MUST match Render env variable EXACTLY
 API_TOKEN = os.getenv("API_TOKEN")
+
 WS_URL = "wss://ws.derivws.com/websockets/v3?app_id=1089"
 
 ws = None
@@ -19,10 +21,18 @@ ws = None
 app = Flask(__name__)
 
 # ===============================
-# 📊 STORAGE
+# 🚀 FORCE START BOT (CRITICAL FIX)
+# ===============================
+def run_bot():
+    print("🚀 Starting bot thread...")
+    connect()
+
+threading.Thread(target=run_bot, daemon=True).start()
+
+# ===============================
+# 📊 SIGNAL STORAGE
 # ===============================
 signals_log = []
-tick_prices = {}
 
 # ===============================
 # 📊 PAIRS
@@ -36,10 +46,10 @@ symbols = [
 ]
 
 # ===============================
-# 🔊 SOUND
+# 🔊 SOUND ALERT
 # ===============================
 def playSound():
-    print("🔊 SIGNAL ALERT!")
+    print("🔊 Beep!")
 
 # ===============================
 # 📉 INDICATORS
@@ -49,6 +59,7 @@ def calculate_rsi(prices, period=14):
         return None
 
     gains, losses = [], []
+
     for i in range(1, len(prices)):
         diff = prices[i] - prices[i - 1]
         if diff > 0:
@@ -79,27 +90,29 @@ def calculate_ema(prices, period):
     return ema
 
 # ===============================
-# 🧠 SIGNAL STRENGTH ENGINE
+# 💪 SIGNAL STRENGTH SCORE
 # ===============================
-def calculate_strength(bos, sweep, fvg, trend, ema_align):
+def calculate_strength(rsi, trend, momentum):
     score = 0
 
-    if bos:
-        score += 25
-    if sweep:
-        score += 25
-    if fvg:
-        score += 20
     if trend:
-        score += 15
-    if ema_align:
-        score += 15
+        score += 40
+    if momentum:
+        score += 30
 
-    return score
+    if rsi:
+        if 40 < rsi < 60:
+            score += 30
+        elif 30 < rsi < 70:
+            score += 20
+
+    return min(score, 100)
 
 # ===============================
-# ⚡ FAST SIGNAL (AI)
+# ⚡ FAST SIGNAL ENGINE (AI)
 # ===============================
+tick_prices = {}
+
 def fastSignal(data):
     if "tick" not in data:
         return
@@ -127,39 +140,52 @@ def fastSignal(data):
     if rsi is None or ema9 is None or ema21 is None:
         return
 
+    momentum_up = prices[-1] > prices[-5]
+    momentum_down = prices[-1] < prices[-5]
+
     trend_up = ema9 > ema21
     trend_down = ema9 < ema21
 
-    valid_buy = trend_up and rsi < 70
-    valid_sell = trend_down and rsi > 30
+    valid_buy = momentum_up and trend_up and rsi < 70
+    valid_sell = momentum_down and trend_down and rsi > 30
 
     if not (valid_buy or valid_sell):
         return
 
-    # strength for fast
-    strength = 60
-    if trend_up and rsi < 60:
-        strength = 80
+    # ✅ MULTI TIMEFRAME CONFIRMATION (simple logic)
+    mtf_confirm = (trend_up and momentum_up) or (trend_down and momentum_down)
+
+    strength = calculate_strength(rsi, trend_up or trend_down, momentum_up or momentum_down)
+
+    quality = "⚠ SCALP"
+    if strength > 75:
+        quality = "🔥 STRONG"
+    elif strength > 50:
+        quality = "⚡ MEDIUM"
 
     result = {
         "symbol": symbol,
         "direction": "BUY" if valid_buy else "SELL",
         "signal": "⚡ FAST AI SIGNAL",
-        "quality": "⚡ FAST",
-        "strength": f"{strength}%",
+        "quality": quality,
+        "strength": strength,
+        "mtf_confirmation": mtf_confirm,
         "entry": price,
+        "sl": None,
+        "tp": None,
         "trend": "UPTREND" if trend_up else "DOWNTREND"
     }
 
     signals_log.append(result)
+
     if len(signals_log) > 50:
         signals_log.pop(0)
 
-    print("🧠 FAST SIGNAL:", result)
+    print("🧠 AI SIGNAL:", result)
     playSound()
 
 # ===============================
-# 🔌 CONNECTION
+# 🔌 CONNECT TO DERIV
 # ===============================
 def connect():
     global ws
@@ -168,15 +194,18 @@ def connect():
             ws = WebSocketApp(
                 WS_URL,
                 on_open=on_open,
-                on_message=on_message
+                on_message=on_message,
+                on_error=on_error,
+                on_close=on_close
             )
             ws.run_forever()
-        except:
+        except Exception as e:
+            print("Reconnect error:", e)
             time.sleep(5)
 
 def on_open(ws):
-    print("✅ Connected")
-    ws.send(json.dumps({"authorize": API_TOKEN}))
+    print("✅ Connected to Deriv")
+    authorize()
 
 def on_message(ws, message):
     data = json.loads(message)
@@ -191,30 +220,50 @@ def on_message(ws, message):
     if data.get("msg_type") == "tick":
         fastSignal(data)
 
+def on_error(ws, error):
+    print("❌ Error:", error)
+
+def on_close(ws, close_status_code, close_msg):
+    print("🔌 Connection closed, retrying...")
+
 # ===============================
-# 📡 FETCH
+# 🔐 AUTHORIZE
+# ===============================
+def authorize():
+    if not API_TOKEN:
+        print("❌ API TOKEN NOT FOUND!")
+        return
+
+    ws.send(json.dumps({
+        "authorize": API_TOKEN
+    }))
+
+# ===============================
+# 📡 FETCH DATA
 # ===============================
 def startFetching():
-    for s in symbols:
+    for symbol in symbols:
         ws.send(json.dumps({
-            "ticks_history": s,
+            "ticks_history": symbol,
             "style": "candles",
             "granularity": 60,
             "count": 100
         }))
+
+    for symbol in symbols:
         ws.send(json.dumps({
-            "ticks": s,
+            "ticks": symbol,
             "subscribe": 1
         }))
 
 # ===============================
-# 🧠 MAIN ANALYSIS
+# 🧠 MARKET ANALYSIS
 # ===============================
 def analyzeMarket(data):
     candles = data.get("candles", [])
     symbol = data.get("echo_req", {}).get("ticks_history")
 
-    if len(candles) < 20:
+    if not candles or len(candles) < 20:
         return
 
     last = candles[-1]
@@ -225,53 +274,40 @@ def analyzeMarket(data):
     highs = [float(c["high"]) for c in candles[-10:]]
     lows = [float(c["low"]) for c in candles[-10:]]
 
-    uptrend = highs[-1] > highs[0]
-    downtrend = highs[-1] < highs[0]
+    uptrend = highs[-1] > highs[0] and lows[-1] > lows[0]
+    downtrend = highs[-1] < highs[0] and lows[-1] < lows[0]
 
-    bos = last["high"] > prev["high"] or last["low"] < prev["low"]
+    resistance = max(highs)
+    support = min(lows)
 
-    sweep = (
-        (last["high"] > prev["high"] and close < prev["high"]) or
-        (last["low"] < prev["low"] and close > prev["low"])
-    )
+    direction = None
+    entry = close
+    sl = None
+    tp = None
 
-    fvg = (
-        float(candles[-3]["high"]) < float(last["low"]) or
-        float(candles[-3]["low"]) > float(last["high"])
-    )
+    if uptrend:
+        direction = "BUY"
+        sl = support
+        tp = entry + (entry - sl) * 2
+    elif downtrend:
+        direction = "SELL"
+        sl = resistance
+        tp = entry - (sl - entry) * 2
 
-    prices = [float(c["close"]) for c in candles]
-    ema9 = calculate_ema(prices, 9)
-    ema21 = calculate_ema(prices, 21)
+    if direction:
+        result = {
+            "symbol": symbol,
+            "direction": direction,
+            "signal": "SMART STRUCTURE",
+            "quality": "⚡ MEDIUM",
+            "strength": 60,
+            "entry": entry,
+            "sl": sl,
+            "tp": tp,
+            "trend": "UPTREND" if uptrend else "DOWNTREND"
+        }
 
-    ema_align = ema9 and ema21 and ((ema9 > ema21) or (ema9 < ema21))
-
-    strength_score = calculate_strength(bos, sweep, fvg, (uptrend or downtrend), ema_align)
-
-    # QUALITY CLASS
-    if strength_score >= 80:
-        quality = "🔥 STRONG"
-    elif strength_score >= 60:
-        quality = "⚡ MEDIUM"
-    else:
-        quality = "⚠ SCALP"
-
-    result = {
-        "symbol": symbol,
-        "direction": "BUY" if uptrend else "SELL",
-        "signal": "SMART ENTRY",
-        "quality": quality,
-        "strength": f"{strength_score}%",
-        "entry": close,
-        "trend": "UPTREND" if uptrend else "DOWNTREND"
-    }
-
-    signals_log.append(result)
-    if len(signals_log) > 50:
-        signals_log.pop(0)
-
-    print("📊 SIGNAL:", result)
-    playSound()
+        signals_log.append(result)
 
 # ===============================
 # 🌐 DASHBOARD
@@ -279,18 +315,18 @@ def analyzeMarket(data):
 @app.route("/")
 def dashboard():
     if not signals_log:
-        return "<h2>⏳ Waiting for signals...</h2>"
+        return jsonify([{"message": "⏳ Waiting for signals..."}])
     return jsonify(signals_log[::-1])
 
 @app.route("/signals")
-def signals():
+def get_signals():
+    if not signals_log:
+        return jsonify([{"message": "⏳ Waiting for signals..."}])
     return jsonify(signals_log)
 
 # ===============================
-# 🚀 START
+# 🚀 RUN FLASK
 # ===============================
-threading.Thread(target=connect, daemon=True).start()
-
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", 10000))
+    port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
