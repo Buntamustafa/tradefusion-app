@@ -143,7 +143,6 @@ def fastSignal(data):
     if not (valid_buy or valid_sell):
         return
 
-    # ⏱ Cooldown
     current_time = time.time()
     if current_time - last_signal_time < 5:
         return
@@ -170,7 +169,6 @@ def fastSignal(data):
         "trend": "UPTREND" if trend_up else "DOWNTREND"
     }
 
-    # 💎 ELITE LOGIC
     strong_trend = abs(ema9 - ema21) > (price * 0.001)
     strong_momentum = abs(prices[-1] - prices[-5]) > (price * 0.0005)
     perfect_rsi = rsi is not None and 45 < rsi < 55
@@ -180,7 +178,6 @@ def fastSignal(data):
     elif strength >= 90:
         result["quality"] = "💎 ELITE"
 
-    # 🚫 Duplicate filter
     if last_signal:
         same_symbol = last_signal["symbol"] == result["symbol"]
         same_direction = last_signal["direction"] == result["direction"]
@@ -214,7 +211,7 @@ def connect():
                 on_error=on_error,
                 on_close=on_close
             )
-            ws.run_forever(ping_interval=20, ping_timeout=10)
+            ws.run_forever()
         except Exception as e:
             print("❌ Connection error:", e)
 
@@ -242,7 +239,7 @@ def on_error(ws, error):
 def on_close(ws, a, b):
     global connected
     connected = False
-    print("🔌 Connection closed, reconnecting...")
+    print("🔌 Reconnecting...")
 
 # ===============================
 # 🔐 AUTHORIZE
@@ -279,12 +276,16 @@ def keep_alive():
         time.sleep(300)
 
 # ===============================
-# 🚀 BOT START
+# 🚀 BOT START (FIXED FOR GUNICORN)
 # ===============================
 def start_background_tasks():
     print("🚀 Starting bot threads...")
+
     threading.Thread(target=connect, daemon=True).start()
     threading.Thread(target=keep_alive, daemon=True).start()
+
+# 🔥 THIS IS THE FIX (AUTO START THREADS)
+start_background_tasks()
 
 # ===============================
 # 🌐 ROUTES
@@ -306,13 +307,3 @@ def status():
         "connected": connected,
         "signals_count": len(signals_log)
     })
-
-# ===============================
-# 🚀 RUN
-# ===============================
-if __name__ == "__main__":
-    start_background_tasks()
-
-    port = int(os.environ.get("PORT", 10000))
-    print(f"🌐 Server running on port {port}")
-    app.run(host="0.0.0.0", port=port)
