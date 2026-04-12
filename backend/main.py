@@ -8,7 +8,7 @@ import time
 import os
 from flask import Flask, jsonify
 
-API_TOKEN = os.getenv("DERIV_API_TOKEN")
+API_TOKEN = os.getenv("API_TOKEN")
 WS_URL = "wss://ws.derivws.com/websockets/v3?app_id=1089"
 
 ws = None
