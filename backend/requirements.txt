@@ -4,3 +4,4 @@ numpy
 requests
 gunicorn
 websocket-client
+idna
