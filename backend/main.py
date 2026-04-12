@@ -1,7 +1,7 @@
 // ===============================
 // 🔐 DERIV CONNECTION
 // ===============================
-const API_TOKEN = "PUT_NEW_TOKEN_HERE";
+const API_TOKEN = "pat_e7824954e7059f0eaf5adda6be29c4f468e349e9027e1b23a5b93d5aa9803d58";
 const WS_URL = "wss://ws.derivws.com/websockets/v3?app_id=1089";
 
 let ws;
