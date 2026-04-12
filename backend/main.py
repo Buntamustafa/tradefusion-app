@@ -8,9 +8,7 @@ import time
 import os
 from flask import Flask, jsonify
 
-# ✅ MUST match Render env variable EXACTLY
 API_TOKEN = os.getenv("API_TOKEN")
-
 WS_URL = "wss://ws.derivws.com/websockets/v3?app_id=1089"
 
 ws = None
@@ -21,18 +19,10 @@ ws = None
 app = Flask(__name__)
 
 # ===============================
-# 🚀 FORCE START BOT (CRITICAL FIX)
-# ===============================
-def run_bot():
-    print("🚀 Starting bot thread...")
-    connect()
-
-threading.Thread(target=run_bot, daemon=True).start()
-
-# ===============================
 # 📊 SIGNAL STORAGE
 # ===============================
 signals_log = []
+tick_prices = {}
 
 # ===============================
 # 📊 PAIRS
@@ -90,7 +80,7 @@ def calculate_ema(prices, period):
     return ema
 
 # ===============================
-# 💪 SIGNAL STRENGTH SCORE
+# 💪 SIGNAL STRENGTH
 # ===============================
 def calculate_strength(rsi, trend, momentum):
     score = 0
@@ -109,10 +99,8 @@ def calculate_strength(rsi, trend, momentum):
     return min(score, 100)
 
 # ===============================
-# ⚡ FAST SIGNAL ENGINE (AI)
+# ⚡ FAST SIGNAL ENGINE
 # ===============================
-tick_prices = {}
-
 def fastSignal(data):
     if "tick" not in data:
         return
@@ -152,9 +140,6 @@ def fastSignal(data):
     if not (valid_buy or valid_sell):
         return
 
-    # ✅ MULTI TIMEFRAME CONFIRMATION (simple logic)
-    mtf_confirm = (trend_up and momentum_up) or (trend_down and momentum_down)
-
     strength = calculate_strength(rsi, trend_up or trend_down, momentum_up or momentum_down)
 
     quality = "⚠ SCALP"
@@ -169,10 +154,7 @@ def fastSignal(data):
         "signal": "⚡ FAST AI SIGNAL",
         "quality": quality,
         "strength": strength,
-        "mtf_confirmation": mtf_confirm,
         "entry": price,
-        "sl": None,
-        "tp": None,
         "trend": "UPTREND" if trend_up else "DOWNTREND"
     }
 
@@ -204,7 +186,7 @@ def connect():
             time.sleep(5)
 
 def on_open(ws):
-    print("✅ Connected to Deriv")
+    print("✅ Connected")
     authorize()
 
 def on_message(ws, message):
@@ -214,29 +196,24 @@ def on_message(ws, message):
         print("🔐 Authorized")
         startFetching()
 
-    if data.get("msg_type") == "candles":
-        analyzeMarket(data)
-
     if data.get("msg_type") == "tick":
         fastSignal(data)
 
 def on_error(ws, error):
     print("❌ Error:", error)
 
-def on_close(ws, close_status_code, close_msg):
-    print("🔌 Connection closed, retrying...")
+def on_close(ws, a, b):
+    print("🔌 Reconnecting...")
 
 # ===============================
 # 🔐 AUTHORIZE
 # ===============================
 def authorize():
     if not API_TOKEN:
-        print("❌ API TOKEN NOT FOUND!")
+        print("❌ NO API TOKEN")
         return
 
-    ws.send(json.dumps({
-        "authorize": API_TOKEN
-    }))
+    ws.send(json.dumps({"authorize": API_TOKEN}))
 
 # ===============================
 # 📡 FETCH DATA
@@ -244,88 +221,41 @@ def authorize():
 def startFetching():
     for symbol in symbols:
         ws.send(json.dumps({
-            "ticks_history": symbol,
-            "style": "candles",
-            "granularity": 60,
-            "count": 100
-        }))
-
-    for symbol in symbols:
-        ws.send(json.dumps({
             "ticks": symbol,
             "subscribe": 1
         }))
 
 # ===============================
-# 🧠 MARKET ANALYSIS
+# 🚀 SAFE BOT START (IMPORTANT)
 # ===============================
-def analyzeMarket(data):
-    candles = data.get("candles", [])
-    symbol = data.get("echo_req", {}).get("ticks_history")
+def run_bot():
+    print("🚀 Bot started...")
+    connect()
 
-    if not candles or len(candles) < 20:
-        return
-
-    last = candles[-1]
-    prev = candles[-2]
-
-    close = float(last["close"])
-
-    highs = [float(c["high"]) for c in candles[-10:]]
-    lows = [float(c["low"]) for c in candles[-10:]]
-
-    uptrend = highs[-1] > highs[0] and lows[-1] > lows[0]
-    downtrend = highs[-1] < highs[0] and lows[-1] < lows[0]
-
-    resistance = max(highs)
-    support = min(lows)
-
-    direction = None
-    entry = close
-    sl = None
-    tp = None
-
-    if uptrend:
-        direction = "BUY"
-        sl = support
-        tp = entry + (entry - sl) * 2
-    elif downtrend:
-        direction = "SELL"
-        sl = resistance
-        tp = entry - (sl - entry) * 2
-
-    if direction:
-        result = {
-            "symbol": symbol,
-            "direction": direction,
-            "signal": "SMART STRUCTURE",
-            "quality": "⚡ MEDIUM",
-            "strength": 60,
-            "entry": entry,
-            "sl": sl,
-            "tp": tp,
-            "trend": "UPTREND" if uptrend else "DOWNTREND"
-        }
-
-        signals_log.append(result)
+if os.environ.get("RENDER"):
+    threading.Thread(target=run_bot, daemon=True).start()
 
 # ===============================
-# 🌐 DASHBOARD
+# 🌐 ROUTES
 # ===============================
 @app.route("/")
-def dashboard():
+def home():
     if not signals_log:
         return jsonify([{"message": "⏳ Waiting for signals..."}])
     return jsonify(signals_log[::-1])
 
 @app.route("/signals")
-def get_signals():
+def signals():
     if not signals_log:
         return jsonify([{"message": "⏳ Waiting for signals..."}])
     return jsonify(signals_log)
 
+@app.route("/test")
+def test():
+    return "✅ Test route working!"
+
 # ===============================
-# 🚀 RUN FLASK
+# 🚀 RUN
 # ===============================
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
