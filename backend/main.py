@@ -87,7 +87,10 @@ def fastSignal(data):
     if "tick" not in data:
         return
 
-    symbol = data.get("echo_req", {}).get("ticks", "")
+    symbol = data.get("echo_req", {}).get("ticks") or data.get("tick", {}).get("symbol", "")
+    if not symbol:
+        return
+
     price = float(data["tick"]["quote"])
 
     if symbol not in tick_prices:
