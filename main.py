@@ -18,9 +18,28 @@ def connect_deriv():
     global connected, signals
 
     def on_message(ws, message):
-        global signals
+        global signals, connected
+
         data = json.loads(message)
 
+        # ✅ AUTH SUCCESS
+        if "authorize" in data:
+            print("✅ Authorized successfully")
+            connected = True
+
+            # Subscribe AFTER authorization
+            ws.send(json.dumps({
+                "ticks": "R_100"
+            }))
+            return
+
+        # ❌ AUTH ERROR
+        if "error" in data:
+            print("❌ Authorization error:", data["error"])
+            connected = False
+            return
+
+        # ✅ HANDLE TICKS
         if "tick" in data:
             tick = data["tick"]
 
@@ -32,31 +51,27 @@ def connect_deriv():
 
             signals.append(signal)
 
-            # Keep last 20 signals only
+            # Keep last 20 signals
             signals = signals[-20:]
 
     def on_open(ws):
         global connected
-        print("Connected to Deriv")
+        print("🔄 Connecting to Deriv...")
+        connected = False
 
+        # Send authorization request
         ws.send(json.dumps({
             "authorize": DERIV_TOKEN
         }))
 
-        ws.send(json.dumps({
-            "ticks": "R_100"
-        }))
-
-        connected = True
-
     def on_close(ws, close_status_code, close_msg):
         global connected
-        print("Disconnected from Deriv")
+        print("🔌 Disconnected from Deriv")
         connected = False
 
     def on_error(ws, error):
         global connected
-        print("Error:", error)
+        print("❌ WebSocket error:", error)
         connected = False
 
     ws = websocket.WebSocketApp(
@@ -70,13 +85,13 @@ def connect_deriv():
     ws.run_forever()
 
 
-# 🔁 Bulletproof background runner
+# 🔁 Auto-reconnect loop (VERY IMPORTANT)
 def start_ws():
     while True:
         try:
             connect_deriv()
         except Exception as e:
-            print("Reconnect error:", e)
+            print("⚠️ Reconnect error:", e)
             time.sleep(5)
 
 
@@ -84,6 +99,9 @@ def start_ws():
 threading.Thread(target=start_ws, daemon=True).start()
 
 
+# ===============================
+# 🌐 ROUTES
+# ===============================
 @app.route("/")
 def home():
     return jsonify({"message": "⏳ Waiting for signals..."})
