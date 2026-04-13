@@ -14,7 +14,7 @@ from flask import Flask, jsonify
 # ===============================
 API_TOKEN = os.getenv("API_TOKEN")
 
-# ✅ FIXED: USE DEFAULT WORKING APP ID
+# ✅ USE DEFAULT DERIV APP ID (NO ACTIVATION NEEDED)
 WS_URL = "wss://ws.derivws.com/websockets/v3?app_id=1089"
 
 ws = None
@@ -292,11 +292,15 @@ def keep_alive():
         time.sleep(300)
 
 # ===============================
-# 🚀 START THREADS
+# 🚀 START THREADS (FIXED FOR GUNICORN)
 # ===============================
 def start_background_tasks():
+    print("🚀 Starting background threads...")
     threading.Thread(target=connect, daemon=True).start()
     threading.Thread(target=keep_alive, daemon=True).start()
+
+# ✅ IMPORTANT: RUN THREADS EVEN WITH GUNICORN
+start_background_tasks()
 
 # ===============================
 # 🌐 ROUTES
@@ -319,9 +323,8 @@ def signals():
     return jsonify(signals_log[-10:])
 
 # ===============================
-# 🚀 RUN
+# 🚀 RUN (LOCAL ONLY)
 # ===============================
 if __name__ == "__main__":
-    start_background_tasks()
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
