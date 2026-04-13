@@ -1,92 +1,74 @@
-from flask import Flask, jsonify
-import websocket
-import json
-import threading
-import time
 import os
+import json
+import websocket
+import threading
+from flask import Flask, jsonify
 
 app = Flask(__name__)
 
-# ENV VARIABLES
 API_TOKEN = os.getenv("API_TOKEN")
 APP_ID = os.getenv("APP_ID")
 
-# GLOBAL STATE
 connected = False
 signals = []
 
-# =========================
-# CONNECT TO DERIV
-# =========================
-def connect_deriv():
+def on_open(ws):
+    global connected
+    print("Connected to Deriv")
+
+    auth_data = {
+        "authorize": API_TOKEN
+    }
+    ws.send(json.dumps(auth_data))
+
+def on_message(ws, message):
     global connected, signals
+    data = json.loads(message)
 
-    while True:
-        try:
-            print("🔄 Connecting to Deriv...")
+    if "authorize" in data:
+        connected = True
+        print("Authorized successfully")
 
-            ws = websocket.WebSocket()
-            ws.connect(f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}")
+        # Subscribe to ticks
+        ws.send(json.dumps({
+            "ticks": "R_100"
+        }))
 
-            # Authorize
-            ws.send(json.dumps({
-                "authorize": API_TOKEN
-            }))
+    if "tick" in data:
+        price = data["tick"]["quote"]
 
-            response = json.loads(ws.recv())
+        signal = {
+            "symbol": "R_100",
+            "price": price
+        }
 
-            if "error" in response:
-                print("❌ Auth failed:", response)
-                connected = False
-                time.sleep(5)
-                continue
+        signals.append(signal)
 
-            print("✅ Connected to Deriv")
-            connected = True
+def on_error(ws, error):
+    global connected
+    connected = False
+    print("Error:", error)
 
-            # Subscribe to ticks (example: Volatility 75)
-            ws.send(json.dumps({
-                "ticks": "R_75"
-            }))
+def on_close(ws, close_status_code, close_msg):
+    global connected
+    connected = False
+    print("Disconnected")
 
-            while True:
-                data = json.loads(ws.recv())
+def start_ws():
+    url = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
 
-                if "tick" in data:
-                    price = data["tick"]["quote"]
+    ws = websocket.WebSocketApp(
+        url,
+        on_open=on_open,
+        on_message=on_message,
+        on_error=on_error,
+        on_close=on_close
+    )
 
-                    # SIMPLE SIGNAL LOGIC (we will upgrade later)
-                    signal = {
-                        "symbol": "R_75",
-                        "price": price,
-                        "direction": "BUY" if int(price) % 2 == 0 else "SELL"
-                    }
+    ws.run_forever()
 
-                    signals.append(signal)
-
-                    # Keep only last 10 signals
-                    signals = signals[-10:]
-
-                    print("📊 Signal:", signal)
-
-        except Exception as e:
-            print("❌ Connection error:", e)
-            connected = False
-            time.sleep(5)
-
-# =========================
-# START BOT THREAD
-# =========================
-def start_bot():
-    thread = threading.Thread(target=connect_deriv)
-    thread.daemon = True
-    thread.start()
-
-start_bot()
-
-# =========================
-# ROUTES
-# =========================
+# Start WebSocket in background
+threading.Thread(target=start_ws).start()
 
 @app.route("/")
 def home():
@@ -101,19 +83,14 @@ def status():
 
 @app.route("/signals")
 def get_signals():
-    if not signals:
-        return jsonify([{"message": "⏳ Waiting for signals..."}])
-    return jsonify(signals)
+    return jsonify(signals[-10:])
 
 @app.route("/check-token")
 def check_token():
     return jsonify({
-        "token_set": API_TOKEN is not None,
-        "app_id_set": APP_ID is not None
+        "token": API_TOKEN,
+        "app_id": APP_ID
     })
 
-# =========================
-# RUN SERVER
-# =========================
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=10000)
+    app.run()
