@@ -1,64 +1,88 @@
 import os
 import json
-import websocket
 import threading
+import websocket
 from flask import Flask, jsonify
 
 app = Flask(__name__)
 
-API_TOKEN = os.getenv("API_TOKEN")
 APP_ID = os.getenv("APP_ID")
+API_TOKEN = os.getenv("DERIV_API_TOKEN")
 
 connected = False
+authorized = False
+last_error = None
+logs = []
 signals = []
 
-def on_open(ws):
-    global connected
-    print("Connected to Deriv")
+def log(msg):
+    print(msg)
+    logs.append(msg)
+    if len(logs) > 50:
+        logs.pop(0)
 
-    auth_data = {
-        "authorize": API_TOKEN
-    }
-    ws.send(json.dumps(auth_data))
+def connect_deriv():
+    global connected, authorized, last_error
 
-def on_message(ws, message):
-    global connected, signals
-    data = json.loads(message)
+    if not APP_ID:
+        log("❌ APP_ID is missing")
+        return
 
-    if "authorize" in data:
+    if not API_TOKEN:
+        log("❌ API_TOKEN is missing")
+        return
+
+    ws_url = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
+    log(f"🔌 Connecting with APP_ID: {APP_ID}")
+
+    def on_open(ws):
+        global connected
         connected = True
-        print("Authorized successfully")
+        log("✅ WebSocket connection opened")
 
-        # Subscribe to ticks
         ws.send(json.dumps({
-            "ticks": "R_100"
+            "authorize": API_TOKEN
         }))
+        log("🔑 Sending authorization...")
 
-    if "tick" in data:
-        price = data["tick"]["quote"]
+    def on_message(ws, message):
+        global authorized, last_error
 
-        signal = {
-            "symbol": "R_100",
-            "price": price
-        }
+        data = json.loads(message)
 
-        signals.append(signal)
+        # DEBUG: log raw message
+        log(f"📩 {data}")
 
-def on_error(ws, error):
-    global connected
-    connected = False
-    print("Error:", error)
+        if "error" in data:
+            last_error = data["error"]["message"]
+            log(f"❌ API Error: {last_error}")
 
-def on_close(ws, close_status_code, close_msg):
-    global connected
-    connected = False
-    print("Disconnected")
+        if "authorize" in data:
+            authorized = True
+            log("✅ Authorized successfully")
 
-def start_ws():
-    url = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
+            ws.send(json.dumps({
+                "ticks": "R_100"
+            }))
+            log("📡 Subscribed to ticks")
+
+        elif "tick" in data:
+            tick = data["tick"]["quote"]
+            signals.append({"price": tick})
+
+    def on_error(ws, error):
+        global last_error
+        last_error = str(error)
+        log(f"❌ WebSocket Error: {error}")
+
+    def on_close(ws, close_status_code, close_msg):
+        global connected, authorized
+        connected = False
+        authorized = False
+        log("🔌 Connection closed")
 
     ws = websocket.WebSocketApp(
-        url,
+        ws_url,
         on_open=on_open,
         on_message=on_message,
         on_error=on_error,
@@ -67,30 +91,38 @@ def start_ws():
 
     ws.run_forever()
 
-# Start WebSocket in background
-threading.Thread(target=start_ws).start()
+# Run in background
+threading.Thread(target=connect_deriv).start()
+
+
+# ROUTES
 
 @app.route("/")
 def home():
-    return jsonify({"message": "⏳ Waiting for signals..."})
+    return jsonify({"message": "Bot running..."})
 
 @app.route("/status")
 def status():
     return jsonify({
         "connected": connected,
-        "signals_count": len(signals)
+        "authorized": authorized,
+        "signals_count": len(signals),
+        "last_error": last_error,
+        "app_id_used": APP_ID
     })
 
-@app.route("/signals")
-def get_signals():
-    return jsonify(signals[-10:])
+@app.route("/logs")
+def get_logs():
+    return jsonify(logs)
 
-@app.route("/check-token")
-def check_token():
+@app.route("/check")
+def check():
     return jsonify({
-        "token": API_TOKEN,
-        "app_id": APP_ID
+        "APP_ID_exists": bool(APP_ID),
+        "TOKEN_exists": bool(API_TOKEN),
+        "APP_ID_value": APP_ID
     })
+
 
 if __name__ == "__main__":
     app.run()
