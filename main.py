@@ -7,110 +7,90 @@ import os
 
 app = Flask(__name__)
 
-signals = []
+# ENV VARIABLES
+API_TOKEN = os.getenv("API_TOKEN")
+APP_ID = os.getenv("APP_ID")
+
+# GLOBAL STATE
 connected = False
+signals = []
 
-# Get token from Render environment
-DERIV_TOKEN = os.getenv("DERIV_TOKEN")
-
-
+# =========================
+# CONNECT TO DERIV
+# =========================
 def connect_deriv():
     global connected, signals
 
-    def on_message(ws, message):
-        global signals, connected
-
-        data = json.loads(message)
-
-        # ✅ AUTH SUCCESS
-        if "authorize" in data:
-            print("✅ Authorized successfully")
-            connected = True
-
-            # Subscribe AFTER authorization
-            ws.send(json.dumps({
-                "ticks": "R_100"
-            }))
-            return
-
-        # ❌ AUTH ERROR
-        if "error" in data:
-            print("❌ Authorization error:", data["error"])
-            connected = False
-            return
-
-        # ✅ HANDLE TICKS
-        if "tick" in data:
-            tick = data["tick"]
-
-            signal = {
-                "symbol": tick["symbol"],
-                "price": tick["quote"],
-                "time": tick["epoch"]
-            }
-
-            signals.append(signal)
-
-            # Keep last 20 signals
-            signals = signals[-20:]
-
-    def on_open(ws):
-        global connected
-        print("🔄 Connecting to Deriv...")
-        connected = False
-
-        # Send authorization request
-        ws.send(json.dumps({
-            "authorize": DERIV_TOKEN
-        }))
-
-    def on_close(ws, close_status_code, close_msg):
-        global connected
-        print("🔌 Disconnected from Deriv")
-        connected = False
-
-    def on_error(ws, error):
-        global connected
-        print("❌ WebSocket error:", error)
-        connected = False
-
-    ws = websocket.WebSocketApp(
-        "wss://ws.derivws.com/websockets/v3",
-        on_open=on_open,
-        on_message=on_message,
-        on_close=on_close,
-        on_error=on_error
-    )
-
-    ws.run_forever()
-
-
-# 🔁 Auto-reconnect loop (VERY IMPORTANT)
-def start_ws():
     while True:
         try:
-            connect_deriv()
+            print("🔄 Connecting to Deriv...")
+
+            ws = websocket.WebSocket()
+            ws.connect(f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}")
+
+            # Authorize
+            ws.send(json.dumps({
+                "authorize": API_TOKEN
+            }))
+
+            response = json.loads(ws.recv())
+
+            if "error" in response:
+                print("❌ Auth failed:", response)
+                connected = False
+                time.sleep(5)
+                continue
+
+            print("✅ Connected to Deriv")
+            connected = True
+
+            # Subscribe to ticks (example: Volatility 75)
+            ws.send(json.dumps({
+                "ticks": "R_75"
+            }))
+
+            while True:
+                data = json.loads(ws.recv())
+
+                if "tick" in data:
+                    price = data["tick"]["quote"]
+
+                    # SIMPLE SIGNAL LOGIC (we will upgrade later)
+                    signal = {
+                        "symbol": "R_75",
+                        "price": price,
+                        "direction": "BUY" if int(price) % 2 == 0 else "SELL"
+                    }
+
+                    signals.append(signal)
+
+                    # Keep only last 10 signals
+                    signals = signals[-10:]
+
+                    print("📊 Signal:", signal)
+
         except Exception as e:
-            print("⚠️ Reconnect error:", e)
+            print("❌ Connection error:", e)
+            connected = False
             time.sleep(5)
 
+# =========================
+# START BOT THREAD
+# =========================
+def start_bot():
+    thread = threading.Thread(target=connect_deriv)
+    thread.daemon = True
+    thread.start()
 
-# Start WebSocket thread
-threading.Thread(target=start_ws, daemon=True).start()
+start_bot()
 
+# =========================
+# ROUTES
+# =========================
 
-# ===============================
-# 🌐 ROUTES
-# ===============================
 @app.route("/")
 def home():
     return jsonify({"message": "⏳ Waiting for signals..."})
-
-
-@app.route("/signals")
-def get_signals():
-    return jsonify(signals)
-
 
 @app.route("/status")
 def status():
@@ -119,9 +99,21 @@ def status():
         "signals_count": len(signals)
     })
 
+@app.route("/signals")
+def get_signals():
+    if not signals:
+        return jsonify([{"message": "⏳ Waiting for signals..."}])
+    return jsonify(signals)
 
 @app.route("/check-token")
 def check_token():
     return jsonify({
-        "token": DERIV_TOKEN
+        "token_set": API_TOKEN is not None,
+        "app_id_set": APP_ID is not None
     })
+
+# =========================
+# RUN SERVER
+# =========================
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=10000)
