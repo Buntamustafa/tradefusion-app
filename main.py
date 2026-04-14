@@ -6,20 +6,20 @@ from flask import Flask, jsonify
 
 app = Flask(__name__)
 
-# ✅ FIX: Use Render environment variable
-API_KEY = os.getenv("TWELVE_API_KEY")
+# ✅ FIXED ENV VARIABLE NAME
+API_KEY = os.getenv("TWELVEDATA_API_KEY")
 
 if not API_KEY:
-    print("❌ ERROR: API KEY NOT FOUND")
+    print("❌ ERROR: API KEY NOT FOUND - CHECK RENDER ENV VARIABLE")
 
 PAIRS = [
-    "EUR/USD",
-    "GBP/USD",
-    "USD/JPY",
+    "EURUSD",   # ✅ FIXED format
+    "GBPUSD",
+    "USDJPY",
     "BTC/USD",
     "ETH/USD",
     "XAU/USD",
-    "XTI/USD"  # ✅ FIXED crude oil symbol
+    "XTI/USD"   # ✅ crude oil
 ]
 
 TIMEFRAMES = ["1min", "5min", "15min"]
@@ -41,7 +41,12 @@ def fetch_data(symbol, timeframe):
     try:
         res = requests.get(url, timeout=10).json()
 
-        # ✅ SHOW API ERRORS
+        # ✅ EMPTY RESPONSE FIX
+        if not res:
+            print(f"❌ EMPTY RESPONSE ({symbol})")
+            return None
+
+        # ✅ API ERROR HANDLING
         if "status" in res and res["status"] == "error":
             error_msg = res.get("message", "Unknown API error")
             print(f"❌ API ERROR ({symbol}):", error_msg)
@@ -111,7 +116,7 @@ def analyze(symbol, data_map):
 
             price = closes[0]
 
-            # TREND
+            # TREND (MA)
             ma = sum(closes[-5:]) / 5
 
             if price > ma:
@@ -127,13 +132,13 @@ def analyze(symbol, data_map):
             if lows[0] < min(lows[1:5]):
                 score += 1
 
-            # LIQUIDITY
+            # LIQUIDITY SWEEP
             if highs[1] > highs[2] and highs[1] > highs[3]:
                 score += 1
             if lows[1] < lows[2] and lows[1] < lows[3]:
                 score += 1
 
-            # CANDLE
+            # CANDLE CONFIRMATION
             if closes[0] > opens[0] and closes[1] < opens[1]:
                 score += 1
             if closes[0] < opens[0] and closes[1] > opens[1]:
@@ -175,7 +180,7 @@ def analyze(symbol, data_map):
 
         final_direction = max(set(direction_votes), key=direction_votes.count)
 
-        # QUALITY
+        # QUALITY CLASSIFICATION
         if total_score >= 10:
             quality = "🔥 ELITE"
         elif total_score >= 7:
@@ -226,7 +231,7 @@ def bot_loop():
                     if signal:
                         new_signals.append(signal)
 
-                time.sleep(8)  # ✅ API LIMIT PROTECTION
+                time.sleep(8)  # ✅ API LIMIT SAFE
 
             signals.clear()
             signals.extend(new_signals)
