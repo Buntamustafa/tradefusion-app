@@ -6,7 +6,11 @@ from flask import Flask, jsonify
 
 app = Flask(__name__)
 
-API_KEY = "YOUR_TWELVE_DATA_API_KEY"
+# ✅ FIX: Use Render environment variable
+API_KEY = os.getenv("TWELVE_API_KEY")
+
+if not API_KEY:
+    print("❌ ERROR: API KEY NOT FOUND")
 
 PAIRS = [
     "EUR/USD",
@@ -15,7 +19,7 @@ PAIRS = [
     "BTC/USD",
     "ETH/USD",
     "XAU/USD",
-    "WTI"
+    "XTI/USD"  # ✅ FIXED crude oil symbol
 ]
 
 TIMEFRAMES = ["1min", "5min", "15min"]
@@ -29,16 +33,26 @@ status = {
 }
 
 # ===============================
-# 📡 FETCH DATA
+# 📡 FETCH DATA (FIXED)
 # ===============================
 def fetch_data(symbol, timeframe):
     url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval={timeframe}&apikey={API_KEY}&outputsize=20"
 
     try:
-        res = requests.get(url).json()
+        res = requests.get(url, timeout=10).json()
 
+        # ✅ SHOW API ERRORS
         if "status" in res and res["status"] == "error":
-            status["last_error"] = res.get("message")
+            error_msg = res.get("message", "Unknown API error")
+            print(f"❌ API ERROR ({symbol}):", error_msg)
+
+            status["last_error"] = error_msg
+            status["api_working"] = False
+            return None
+
+        # ✅ SAFE DATA CHECK
+        if "values" not in res:
+            print(f"❌ NO DATA ({symbol}):", res)
             status["api_working"] = False
             return None
 
@@ -46,6 +60,7 @@ def fetch_data(symbol, timeframe):
         return res["values"]
 
     except Exception as e:
+        print(f"❌ FETCH ERROR ({symbol}):", e)
         status["last_error"] = str(e)
         status["api_working"] = False
         return None
@@ -57,12 +72,10 @@ def fetch_data(symbol, timeframe):
 def detect_order_block(opens, closes, highs, lows, direction):
     try:
         for i in range(5, len(closes)):
-            # Bullish OB (last bearish before move up)
             if direction == "BUY":
                 if closes[i] < opens[i] and closes[i-1] > highs[i]:
                     return lows[i]
 
-            # Bearish OB (last bullish before move down)
             if direction == "SELL":
                 if closes[i] > opens[i] and closes[i-1] < lows[i]:
                     return highs[i]
@@ -98,9 +111,7 @@ def analyze(symbol, data_map):
 
             price = closes[0]
 
-            # =========================
             # TREND
-            # =========================
             ma = sum(closes[-5:]) / 5
 
             if price > ma:
@@ -110,33 +121,25 @@ def analyze(symbol, data_map):
                 direction = "SELL"
                 score += 1
 
-            # =========================
             # BOS
-            # =========================
             if highs[0] > max(highs[1:5]):
                 score += 1
             if lows[0] < min(lows[1:5]):
                 score += 1
 
-            # =========================
             # LIQUIDITY
-            # =========================
             if highs[1] > highs[2] and highs[1] > highs[3]:
                 score += 1
             if lows[1] < lows[2] and lows[1] < lows[3]:
                 score += 1
 
-            # =========================
             # CANDLE
-            # =========================
             if closes[0] > opens[0] and closes[1] < opens[1]:
                 score += 1
             if closes[0] < opens[0] and closes[1] > opens[1]:
                 score += 1
 
-            # =========================
             # MOMENTUM
-            # =========================
             if abs(closes[0] - closes[3]) > 0.001:
                 score += 1
 
@@ -145,9 +148,7 @@ def analyze(symbol, data_map):
             if direction:
                 direction_votes.append(direction)
 
-                # =========================
                 # ORDER BLOCK ENTRY
-                # =========================
                 ob = detect_order_block(opens, closes, highs, lows, direction)
 
                 if ob:
@@ -155,17 +156,13 @@ def analyze(symbol, data_map):
                 else:
                     final_entry = price
 
-                # =========================
                 # STOP LOSS
-                # =========================
                 if direction == "BUY":
                     final_sl = min(lows[1:5])
                 else:
                     final_sl = max(highs[1:5])
 
-                # =========================
                 # TAKE PROFIT (RR 1:2)
-                # =========================
                 risk = abs(final_entry - final_sl)
 
                 if direction == "BUY":
@@ -178,9 +175,7 @@ def analyze(symbol, data_map):
 
         final_direction = max(set(direction_votes), key=direction_votes.count)
 
-        # =========================
         # QUALITY
-        # =========================
         if total_score >= 10:
             quality = "🔥 ELITE"
         elif total_score >= 7:
@@ -203,7 +198,7 @@ def analyze(symbol, data_map):
         }
 
     except Exception as e:
-        print("Analyze error:", e)
+        print("❌ Analyze error:", e)
         return None
 
 
@@ -221,7 +216,7 @@ def bot_loop():
             current_tf = TIMEFRAMES[tf_index % len(TIMEFRAMES)]
 
             for pair in PAIRS:
-                print(f"Fetching {pair} @ {current_tf}")
+                print(f"📡 Fetching {pair} @ {current_tf}")
 
                 data = fetch_data(pair, current_tf)
 
@@ -231,7 +226,7 @@ def bot_loop():
                     if signal:
                         new_signals.append(signal)
 
-                time.sleep(8)
+                time.sleep(8)  # ✅ API LIMIT PROTECTION
 
             signals.clear()
             signals.extend(new_signals)
@@ -240,6 +235,7 @@ def bot_loop():
             tf_index += 1
 
         except Exception as e:
+            print("❌ BOT LOOP ERROR:", e)
             status["last_error"] = str(e)
             status["connected"] = False
 
@@ -262,6 +258,7 @@ def get_signals():
 @app.route("/status")
 def get_status():
     return jsonify(status)
+
 
 # ===============================
 # 🚀 START
