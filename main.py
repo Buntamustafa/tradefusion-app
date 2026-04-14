@@ -7,7 +7,7 @@ from flask import Flask, jsonify
 app = Flask(__name__)
 
 # ✅ FIXED ENV VARIABLE NAME
-API_KEY = os.getenv("TWELVEDATA_API_KEY")
+API_KEY = os.getenv("TWELVEDATA_API_KEY") or "1c9bcfde21374f1f8e0565bd72585821"
 
 if not API_KEY:
     print("❌ ERROR: API KEY NOT FOUND - CHECK RENDER ENV VARIABLE")
