@@ -1,89 +1,197 @@
-<!-- ================= BACKEND: main.py ================= -->Save this as main.py
+import requests
+import pandas as pd
+import websocket
+import json
+import threading
+import time
+from flask import Flask, jsonify, render_template_string
 
-import requests import pandas as pd import websocket import json import threading import time from flask import Flask, jsonify, render_template_string
+app = Flask(__name__)
 
-app = Flask(name)
+# ================= CONFIG =================
+SYMBOLS = ["BTCUSDT", "ETHUSDT", "XRPUSDT"]
+TIMEFRAMES = ["1h", "15m", "5m"]
 
-SYMBOLS = ["BTCUSDT", "ETHUSDT", "XRPUSDT"] TIMEFRAMES = ["1h", "15m", "5m"]
+market_data = {sym: {tf: [] for tf in TIMEFRAMES} for sym in SYMBOLS}
+signals_cache = []
 
-market_data = {sym: {tf: [] for tf in TIMEFRAMES} for sym in SYMBOLS} signals_cache = [] last_signals = {}
+bot_started = False  # جلوگیری از اجرای چندباره
 
-================= DATA =================
+# ================= SAFE REQUEST =================
+def safe_request(url, retries=3):
+    for _ in range(retries):
+        try:
+            return requests.get(url, timeout=10).json()
+        except:
+            time.sleep(1)
+    return []
 
-def fetch_historical(symbol, tf): url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={tf}&limit=200" data = requests.get(url).json() market_data[symbol][tf] = [{ "open": float(d[1]), "high": float(d[2]), "low": float(d[3]), "close": float(d[4]), "volume": float(d[5]) } for d in data]
+# ================= FETCH =================
+def fetch_historical(symbol, tf):
+    url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={tf}&limit=200"
+    data = safe_request(url)
 
-================= WS =================
+    candles = []
+    for d in data:
+        try:
+            candles.append({
+                "open": float(d[1]),
+                "high": float(d[2]),
+                "low": float(d[3]),
+                "close": float(d[4]),
+                "volume": float(d[5])
+            })
+        except:
+            continue
 
-def on_message(ws, message): data = json.loads(message) if "data" in data: k = data["data"]["k"] sym = k["s"] candle = { "open": float(k["o"]), "high": float(k["h"]), "low": float(k["l"]), "close": float(k["c"]), "volume": float(k["v"]) } market_data[sym]["5m"].append(candle) if len(market_data[sym]["5m"]) > 200: market_data[sym]["5m"].pop(0)
+    market_data[symbol][tf] = candles
 
-def start_ws(): streams = [f"{s.lower()}@kline_5m" for s in SYMBOLS] url = f"wss://stream.binance.com:9443/stream?streams={'/'.join(streams)}" websocket.WebSocketApp(url, on_message=on_message).run_forever()
+# ================= WS =================
+def on_message(ws, message):
+    try:
+        data = json.loads(message)
+        if "data" in data:
+            k = data["data"]["k"]
+            sym = k["s"]
 
-================= LOGIC =================
+            candle = {
+                "open": float(k["o"]),
+                "high": float(k["h"]),
+                "low": float(k["l"]),
+                "close": float(k["c"]),
+                "volume": float(k["v"])
+            }
 
-def add_indicators(df): df["ema50"] = df["close"].ewm(span=50).mean() df["ema200"] = df["close"].ewm(span=200).mean() df["range"] = df["high"] - df["low"] df["volatility"] = df["range"].rolling(14).mean() return df
+            market_data[sym]["5m"].append(candle)
 
-def detect_trend(df): return "UP" if df["ema50"].iloc[-1] > df["ema200"].iloc[-1] else "DOWN"
+            if len(market_data[sym]["5m"]) > 200:
+                market_data[sym]["5m"].pop(0)
 
-def detect_bos(df): return df["high"].iloc[-1] > df["high"].rolling(10).max().iloc[-2]
+    except Exception as e:
+        print("WS MESSAGE ERROR:", e)
 
-def detect_fvg(df): return df["low"].iloc[-1] > df["high"].iloc[-3]
+def on_error(ws, error):
+    print("WS ERROR:", error)
 
-def strong_trend(df): return abs(df["ema50"].iloc[-1] - df["ema200"].iloc[-1]) > df["close"].iloc[-1]*0.002
+def on_close(ws, close_status_code, close_msg):
+    print("WS CLOSED:", close_msg)
 
-def analyze(symbol): score = 0 confirmations = [] trends = []
+def start_ws():
+    while True:
+        try:
+            streams = [f"{s.lower()}@kline_5m" for s in SYMBOLS]
+            url = f"wss://stream.binance.com:9443/stream?streams={'/'.join(streams)}"
 
-for tf in TIMEFRAMES:
-    df = pd.DataFrame(market_data[symbol][tf])
+            ws = websocket.WebSocketApp(
+                url,
+                on_message=on_message,
+                on_error=on_error,
+                on_close=on_close
+            )
+            ws.run_forever()
+        except Exception as e:
+            print("WS RECONNECT:", e)
+            time.sleep(5)
+
+# ================= INDICATORS =================
+def add_indicators(df):
+    df["ema50"] = df["close"].ewm(span=50).mean()
+    df["ema200"] = df["close"].ewm(span=200).mean()
+    return df
+
+# ================= STRATEGIES =================
+def detect_trend(df):
+    return "UP" if df["ema50"].iloc[-1] > df["ema200"].iloc[-1] else "DOWN"
+
+def detect_bos(df):
+    return df["high"].iloc[-1] > df["high"].rolling(10).max().iloc[-2]
+
+def detect_fvg(df):
+    return df["low"].iloc[-1] > df["high"].iloc[-3]
+
+def strong_trend(df):
+    return abs(df["ema50"].iloc[-1] - df["ema200"].iloc[-1]) > df["close"].iloc[-1]*0.002
+
+# ================= ANALYSIS =================
+def analyze(symbol):
+    score = 0
+    trends = []
+
+    for tf in TIMEFRAMES:
+        df = pd.DataFrame(market_data[symbol][tf])
+
+        if len(df) < 50:
+            return 0, "NONE"
+
+        df = add_indicators(df)
+        trend = detect_trend(df)
+        trends.append(trend)
+
+        try:
+            if detect_bos(df): score += 20
+            if detect_fvg(df): score += 20
+            if strong_trend(df): score += 20
+        except:
+            continue
+
+    trend = "UP" if trends.count("UP") >= 2 else "DOWN"
+    return score, trend
+
+# ================= % =================
+def classify(score):
+    percent = int((score / 150) * 100)
+    return max(10, min(percent, 100))
+
+# ================= SIGNAL =================
+def generate_signal(sym):
+    score, trend = analyze(sym)
+
+    df = pd.DataFrame(market_data[sym]["5m"])
     if len(df) < 50:
-        return 0, "NONE", []
+        return None
 
-    df = add_indicators(df)
-    trend = detect_trend(df)
-    trends.append(trend)
+    price = df["close"].iloc[-1]
+    confidence = classify(score)
 
-    if detect_bos(df):
-        score += 20
-        confirmations.append("BOS")
+    tradable = score >= 100
 
-    if detect_fvg(df):
-        score += 20
-        confirmations.append("FVG")
+    tp = price * (1.02 if trend == "UP" else 0.98)
+    sl = price * (0.995 if trend == "UP" else 1.005)
 
-    if strong_trend(df):
-        score += 20
-        confirmations.append("STRONG")
+    return {
+        "symbol": sym,
+        "trend": trend,
+        "entry": round(price, 2),
+        "tp": round(tp, 2),
+        "sl": round(sl, 2),
+        "confidence": confidence,
+        "tradable": tradable
+    }
 
-trend = "UP" if trends.count("UP") >= 2 else "DOWN"
-return score, trend, confirmations
+# ================= LOOP =================
+def signal_loop():
+    global signals_cache
+    while True:
+        try:
+            new_signals = []
+            for sym in SYMBOLS:
+                sig = generate_signal(sym)
+                if sig:
+                    new_signals.append(sig)
 
-def classify(score): percent = int((score/150)*100) return max(10, min(percent, 100))
+            signals_cache = new_signals
+            time.sleep(5)
 
-def generate_signal(sym): score, trend, conf = analyze(sym) df = pd.DataFrame(market_data[sym]["5m"]) if len(df) < 50: return None
+        except Exception as e:
+            print("LOOP ERROR:", e)
+            time.sleep(5)
 
-price = df["close"].iloc[-1]
-percent = classify(score)
-
-tradable = score >= 100
-
-return {
-    "symbol": sym,
-    "trend": trend,
-    "entry": round(price, 2),
-    "tp": round(price*1.02 if trend=="UP" else price*0.98, 2),
-    "sl": round(price*0.995 if trend=="UP" else price*1.005, 2),
-    "confidence": percent,
-    "tradable": tradable
-}
-
-def loop(): global signals_cache while True: signals_cache = [s for s in [generate_signal(sym) for sym in SYMBOLS] if s] time.sleep(5)
-
-================= UI =================
-
+# ================= UI =================
 HTML = """
-
-<!DOCTYPE html><html>
+<!DOCTYPE html>
+<html>
 <head>
-<title>AI Trading Dashboard</title>
+<title>AI Dashboard</title>
 <style>
 body { background:#0f172a; color:white; font-family:sans-serif }
 .card { padding:15px; margin:10px; border-radius:10px }
@@ -95,7 +203,12 @@ body { background:#0f172a; color:white; font-family:sans-serif }
 <body>
 <h2>🚀 AI Signals</h2>
 <div id="signals"></div>
-<audio id="alert" src="https://www.soundjay.com/buttons/sounds/button-3.mp3"></audio><script>
+
+<audio id="alert" src="https://www.soundjay.com/buttons/sounds/button-3.mp3"></audio>
+
+<script>
+let lastAlert = "";
+
 async function load(){
  let res = await fetch('/signals');
  let data = await res.json();
@@ -104,8 +217,11 @@ async function load(){
  data.forEach(s=>{
    let color = s.confidence>=80?'green':s.confidence>=60?'yellow':'red';
 
-   if(s.tradable){
+   let id = s.symbol + s.entry;
+
+   if(s.tradable && id !== lastAlert){
      document.getElementById('alert').play();
+     lastAlert = id;
    }
 
    html += `<div class="card ${color}">
@@ -124,17 +240,38 @@ async function load(){
 
 setInterval(load,3000);
 load();
-</script></body>
+</script>
+</body>
 </html>
-"""@app.route('/') def home(): return render_template_string(HTML)
+"""
 
-@app.route('/signals') def signals(): return jsonify(signals_cache)
+# ================= ROUTES =================
+@app.route("/")
+def home():
+    return render_template_string(HTML)
 
-================= START =================
+@app.route("/signals")
+def signals():
+    return jsonify(signals_cache)
 
-def start(): for s in SYMBOLS: for tf in TIMEFRAMES: fetch_historical(s, tf)
+@app.route("/status")
+def status():
+    return jsonify({"status": "RUNNING"})
 
-threading.Thread(target=start_ws, daemon=True).start()
-threading.Thread(target=loop, daemon=True).start()
+# ================= SAFE START =================
+def start_bot_once():
+    global bot_started
+    if bot_started:
+        return
+    bot_started = True
 
-if name == 'main': start() app.run(host='0.0.0.0', port=10000)
+    print("BOT STARTED")
+
+    for s in SYMBOLS:
+        for tf in TIMEFRAMES:
+            fetch_historical(s, tf)
+
+    threading.Thread(target=start_ws, daemon=True).start()
+    threading.Thread(target=signal_loop, daemon=True).start()
+
+start_bot_once()
