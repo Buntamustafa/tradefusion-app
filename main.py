@@ -45,7 +45,7 @@ def fetch_historical(symbol, tf):
         print("REST ERROR:", e)
 
 # ==============================
-# WEBSOCKET (LIVE)
+# WEBSOCKET
 # ==============================
 def on_message(ws, message):
     try:
@@ -180,17 +180,21 @@ def analyze_symbol(symbol):
     return int(score), trend, confirmations
 
 # ==============================
-# CLASSIFICATION
+# CLASSIFICATION (EXPANDED)
 # ==============================
 def classify(score):
     if score >= 130:
         return "🔥 ELITE", 92
-    elif score >= 100:
+    elif score >= 110:
         return "💪 STRONG", 85
+    elif score >= 90:
+        return "⚖️ MEDIUM", 75
     elif score >= 70:
-        return "⚖️ MEDIUM", 70
+        return "📉 LOW", 65
+    elif score >= 50:
+        return "🔻 LOWER", 55
     else:
-        return "⚠️ LOW", 55
+        return "⚠️ LOWEST", 45
 
 # ==============================
 # DUPLICATE FILTER
@@ -207,7 +211,7 @@ def is_duplicate(symbol, trend, entry):
     return False
 
 # ==============================
-# FINAL FILTER
+# STRICT FILTER (UNCHANGED)
 # ==============================
 def final_filter(score, confirmations):
     required = ["BOS", "FVG", "StrongTrend"]
@@ -229,10 +233,8 @@ def generate_signal(symbol):
     if is_duplicate(symbol, trend, price):
         return None
 
-    if not final_filter(score, confirmations):
-        return None
-
     quality, confidence = classify(score)
+    tradable = final_filter(score, confirmations)
 
     if trend == "UP":
         tp = price * 1.02
@@ -250,7 +252,8 @@ def generate_signal(symbol):
         "quality": quality,
         "confidence": confidence,
         "score": score,
-        "confirmations": confirmations
+        "confirmations": confirmations,
+        "tradable": tradable
     }
 
 # ==============================
