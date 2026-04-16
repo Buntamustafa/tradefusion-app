@@ -15,7 +15,6 @@ TIMEFRAMES = ["1h", "15m", "5m"]
 market_data = {sym: {tf: [] for tf in TIMEFRAMES} for sym in SYMBOLS}
 signals_cache = []
 market_strength_value = 0
-
 bot_started = False
 
 # ================= SAFE REQUEST =================
@@ -46,6 +45,18 @@ def fetch_historical(symbol, tf):
             continue
 
     market_data[symbol][tf] = candles
+
+# ================= CONTINUOUS HTF REFRESH =================
+def refresh_higher_timeframes():
+    while True:
+        try:
+            for s in SYMBOLS:
+                fetch_historical(s, "1h")
+                fetch_historical(s, "15m")
+        except Exception as e:
+            print("REFRESH ERROR:", e)
+
+        time.sleep(60)
 
 # ================= WS =================
 def on_message(ws, message):
@@ -195,6 +206,7 @@ def signal_loop():
             market_strength_value = calculate_market_strength()
 
             print("Market Strength:", market_strength_value)
+            print("DATA:", {s: {tf: len(market_data[s][tf]) for tf in TIMEFRAMES} for s in SYMBOLS})
 
             time.sleep(5)
 
@@ -294,11 +306,14 @@ def start_bot_once():
         return
     bot_started = True
 
+    print("BOT STARTED")
+
     for s in SYMBOLS:
         for tf in TIMEFRAMES:
             fetch_historical(s, tf)
 
     threading.Thread(target=start_ws, daemon=True).start()
     threading.Thread(target=signal_loop, daemon=True).start()
+    threading.Thread(target=refresh_higher_timeframes, daemon=True).start()
 
 start_bot_once()
