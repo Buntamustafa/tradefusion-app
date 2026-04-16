@@ -3,7 +3,6 @@ from flask import Flask, jsonify
 
 app = Flask(__name__)
 
-# ✅ Binance uses THIS format
 PAIRS = [
     "BTCUSDT",
     "ETHUSDT",
@@ -16,20 +15,34 @@ last_error = None
 
 
 # =========================
-# 📊 GET DATA FROM BINANCE
+# 📊 GET MARKET DATA (BINANCE + FALLBACK)
 # =========================
 def get_price(symbol):
     global last_error
+
     try:
+        # 🔥 PRIMARY: BINANCE
         url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval=1m&limit=50"
-        res = requests.get(url).json()
+        res = requests.get(url, timeout=10).json()
 
-        if not isinstance(res, list):
-            last_error = res
-            return None
+        if isinstance(res, list):
+            closes = [float(x[4]) for x in res]
+            return closes
 
-        closes = [float(x[4]) for x in res]  # close price
-        return closes
+        # ❌ Binance failed → store error
+        last_error = res
+
+        # 🔁 FALLBACK: CRYPTOCOMPARE
+        fallback_symbol = symbol.replace("USDT", "")
+        url2 = f"https://min-api.cryptocompare.com/data/v2/histominute?fsym={fallback_symbol}&tsym=USDT&limit=50"
+        res2 = requests.get(url2, timeout=10).json()
+
+        if res2.get("Response") == "Success":
+            closes = [x["close"] for x in res2["Data"]["Data"]]
+            return closes
+
+        last_error = res2
+        return None
 
     except Exception as e:
         last_error = str(e)
@@ -45,6 +58,7 @@ def calculate_rsi(data, period=14):
 
     for i in range(1, len(data)):
         diff = data[i] - data[i - 1]
+
         if diff >= 0:
             gains.append(diff)
             losses.append(0)
@@ -153,7 +167,7 @@ def generate_signal(symbol):
 def home():
     return jsonify({
         "status": "running",
-        "message": "🔥 Binance Signal Engine Active",
+        "message": "🔥 Multi-source Signal Engine Active",
         "pairs": PAIRS
     })
 
@@ -179,6 +193,6 @@ def status():
 
 
 # =========================
-# 🚀 START
+# 🚀 START APP
 # =========================
 app.run(host="0.0.0.0", port=10000)
