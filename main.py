@@ -14,8 +14,9 @@ TIMEFRAMES = ["1h", "15m", "5m"]
 
 market_data = {sym: {tf: [] for tf in TIMEFRAMES} for sym in SYMBOLS}
 signals_cache = []
+market_strength_value = 0
 
-bot_started = False  # جلوگیری از اجرای چندباره
+bot_started = False
 
 # ================= SAFE REQUEST =================
 def safe_request(url, retries=3):
@@ -68,29 +69,16 @@ def on_message(ws, message):
                 market_data[sym]["5m"].pop(0)
 
     except Exception as e:
-        print("WS MESSAGE ERROR:", e)
-
-def on_error(ws, error):
-    print("WS ERROR:", error)
-
-def on_close(ws, close_status_code, close_msg):
-    print("WS CLOSED:", close_msg)
+        print("WS ERROR:", e)
 
 def start_ws():
     while True:
         try:
             streams = [f"{s.lower()}@kline_5m" for s in SYMBOLS]
             url = f"wss://stream.binance.com:9443/stream?streams={'/'.join(streams)}"
-
-            ws = websocket.WebSocketApp(
-                url,
-                on_message=on_message,
-                on_error=on_error,
-                on_close=on_close
-            )
+            ws = websocket.WebSocketApp(url, on_message=on_message)
             ws.run_forever()
-        except Exception as e:
-            print("WS RECONNECT:", e)
+        except:
             time.sleep(5)
 
 # ================= INDICATORS =================
@@ -148,7 +136,15 @@ def generate_signal(sym):
 
     df = pd.DataFrame(market_data[sym]["5m"])
     if len(df) < 50:
-        return None
+        return {
+            "symbol": sym,
+            "trend": "WAIT",
+            "entry": 0,
+            "tp": 0,
+            "sl": 0,
+            "confidence": 10,
+            "tradable": False
+        }
 
     price = df["close"].iloc[-1]
     confidence = classify(score)
@@ -168,18 +164,38 @@ def generate_signal(sym):
         "tradable": tradable
     }
 
+# ================= MARKET STRENGTH =================
+def calculate_market_strength():
+    total_score = 0
+    count = 0
+
+    for sym in SYMBOLS:
+        score, _ = analyze(sym)
+        total_score += score
+        count += 1
+
+    if count == 0:
+        return 0
+
+    return int((total_score / (150 * count)) * 100)
+
 # ================= LOOP =================
 def signal_loop():
-    global signals_cache
+    global signals_cache, market_strength_value
+
     while True:
         try:
             new_signals = []
+
             for sym in SYMBOLS:
                 sig = generate_signal(sym)
-                if sig:
-                    new_signals.append(sig)
+                new_signals.append(sig)
 
             signals_cache = new_signals
+            market_strength_value = calculate_market_strength()
+
+            print("Market Strength:", market_strength_value)
+
             time.sleep(5)
 
         except Exception as e:
@@ -201,7 +217,10 @@ body { background:#0f172a; color:white; font-family:sans-serif }
 </style>
 </head>
 <body>
-<h2>🚀 AI Signals</h2>
+<h2>🚀 AI Crypto Signals</h2>
+
+<h3 id="strength"></h3>
+
 <div id="signals"></div>
 
 <audio id="alert" src="https://www.soundjay.com/buttons/sounds/button-3.mp3"></audio>
@@ -212,26 +231,36 @@ let lastAlert = "";
 async function load(){
  let res = await fetch('/signals');
  let data = await res.json();
+
+ let strengthRes = await fetch('/strength');
+ let strengthData = await strengthRes.json();
+
+ let s = strengthData.strength;
+ let color = s>=80?'🟢':s>=50?'🟡':'🔴';
+
+ document.getElementById('strength').innerHTML =
+   "Market Strength: " + color + " " + s + "%";
+
  let html = '';
 
- data.forEach(s=>{
-   let color = s.confidence>=80?'green':s.confidence>=60?'yellow':'red';
+ data.forEach(x=>{
+   let c = x.confidence>=80?'green':x.confidence>=60?'yellow':'red';
 
-   let id = s.symbol + s.entry;
+   let id = x.symbol + x.entry;
 
-   if(s.tradable && id !== lastAlert){
+   if(x.tradable && id !== lastAlert){
      document.getElementById('alert').play();
      lastAlert = id;
    }
 
-   html += `<div class="card ${color}">
-   <b>${s.symbol}</b><br>
-   Trend: ${s.trend}<br>
-   Entry: ${s.entry}<br>
-   TP: ${s.tp}<br>
-   SL: ${s.sl}<br>
-   Confidence: ${s.confidence}%<br>
-   Tradable: ${s.tradable}
+   html += `<div class="card ${c}">
+   <b>${x.symbol}</b><br>
+   Trend: ${x.trend}<br>
+   Entry: ${x.entry}<br>
+   TP: ${x.tp}<br>
+   SL: ${x.sl}<br>
+   Confidence: ${x.confidence}%<br>
+   Tradable: ${x.tradable}
    </div>`;
  });
 
@@ -254,18 +283,16 @@ def home():
 def signals():
     return jsonify(signals_cache)
 
-@app.route("/status")
-def status():
-    return jsonify({"status": "RUNNING"})
+@app.route("/strength")
+def strength():
+    return jsonify({"strength": market_strength_value})
 
-# ================= SAFE START =================
+# ================= START =================
 def start_bot_once():
     global bot_started
     if bot_started:
         return
     bot_started = True
-
-    print("BOT STARTED")
 
     for s in SYMBOLS:
         for tf in TIMEFRAMES:
