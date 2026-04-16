@@ -1,37 +1,35 @@
 import requests
-import os
 from flask import Flask, jsonify
 
 app = Flask(__name__)
 
-API_KEY = os.getenv("TWELVEDATA_API_KEY")
-
+# ✅ Binance uses THIS format
 PAIRS = [
-    "BTC/USDT",
-    "ETH/USDT",
-    "XRP/USDT",
-    "BNB/USDT",
-    "SOL/USDT"
+    "BTCUSDT",
+    "ETHUSDT",
+    "XRPUSDT",
+    "BNBUSDT",
+    "SOLUSDT"
 ]
 
 last_error = None
 
 
 # =========================
-# 📊 FETCH MARKET DATA
+# 📊 GET DATA FROM BINANCE
 # =========================
 def get_price(symbol):
     global last_error
     try:
-        url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval=1min&outputsize=50&apikey={API_KEY}"
+        url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval=1m&limit=50"
         res = requests.get(url).json()
 
-        if "values" not in res:
+        if not isinstance(res, list):
             last_error = res
             return None
 
-        closes = [float(x["close"]) for x in res["values"]]
-        return closes[::-1]
+        closes = [float(x[4]) for x in res]  # close price
+        return closes
 
     except Exception as e:
         last_error = str(e)
@@ -82,7 +80,7 @@ def generate_signal(symbol):
     price = data[-1]
     rsi = calculate_rsi(data)
 
-    # 🔥 STRONG SIGNAL
+    # 🔥 STRONG
     if rsi < 25:
         return {
             "symbol": symbol,
@@ -107,7 +105,7 @@ def generate_signal(symbol):
             "rsi": round(rsi, 2)
         }
 
-    # ⚡ MEDIUM SIGNAL
+    # ⚡ MEDIUM
     elif rsi < 40:
         return {
             "symbol": symbol,
@@ -132,7 +130,7 @@ def generate_signal(symbol):
             "rsi": round(rsi, 2)
         }
 
-    # ⚠️ LOW QUALITY (ALWAYS SEND)
+    # ⚠️ LOW (ALWAYS SEND)
     else:
         direction = "BUY" if rsi < 50 else "SELL"
 
@@ -155,7 +153,7 @@ def generate_signal(symbol):
 def home():
     return jsonify({
         "status": "running",
-        "message": "🔥 Signal engine active",
+        "message": "🔥 Binance Signal Engine Active",
         "pairs": PAIRS
     })
 
@@ -181,6 +179,6 @@ def status():
 
 
 # =========================
-# 🚀 START APP
+# 🚀 START
 # =========================
 app.run(host="0.0.0.0", port=10000)
