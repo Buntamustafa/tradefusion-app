@@ -1,6 +1,4 @@
 import requests
-import time
-import threading
 import os
 from flask import Flask, jsonify
 
@@ -8,32 +6,34 @@ app = Flask(__name__)
 
 API_KEY = os.getenv("TWELVEDATA_API_KEY")
 
-# 🔥 Add as many pairs as you want
 PAIRS = [
-    "BTC/USDT", "ETH/USDT", "XRP/USDT",
-    "BNB/USDT", "SOL/USDT"
+    "BTC/USDT",
+    "ETH/USDT",
+    "XRP/USDT",
+    "BNB/USDT",
+    "SOL/USDT"
 ]
 
-signals_store = []
 last_error = None
 
 
 # =========================
-# 📊 DATA FETCH
+# 📊 FETCH MARKET DATA
 # =========================
 def get_price(symbol):
+    global last_error
     try:
         url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval=1min&outputsize=50&apikey={API_KEY}"
         res = requests.get(url).json()
 
         if "values" not in res:
+            last_error = res
             return None
 
         closes = [float(x["close"]) for x in res["values"]]
         return closes[::-1]
 
     except Exception as e:
-        global last_error
         last_error = str(e)
         return None
 
@@ -42,7 +42,8 @@ def get_price(symbol):
 # 📈 RSI CALCULATION
 # =========================
 def calculate_rsi(data, period=14):
-    gains, losses = [], []
+    gains = []
+    losses = []
 
     for i in range(1, len(data)):
         diff = data[i] - data[i - 1]
@@ -81,14 +82,14 @@ def generate_signal(symbol):
     price = data[-1]
     rsi = calculate_rsi(data)
 
-    # 🔥 STRONG
+    # 🔥 STRONG SIGNAL
     if rsi < 25:
         return {
             "symbol": symbol,
             "direction": "BUY",
             "entry": price,
-            "tp": price * 1.01,
-            "sl": price * 0.99,
+            "tp": round(price * 1.01, 6),
+            "sl": round(price * 0.99, 6),
             "quality": "🔥 STRONG",
             "confidence": 90,
             "rsi": round(rsi, 2)
@@ -99,21 +100,21 @@ def generate_signal(symbol):
             "symbol": symbol,
             "direction": "SELL",
             "entry": price,
-            "tp": price * 0.99,
-            "sl": price * 1.01,
+            "tp": round(price * 0.99, 6),
+            "sl": round(price * 1.01, 6),
             "quality": "🔥 STRONG",
             "confidence": 90,
             "rsi": round(rsi, 2)
         }
 
-    # ⚡ MEDIUM
+    # ⚡ MEDIUM SIGNAL
     elif rsi < 40:
         return {
             "symbol": symbol,
             "direction": "BUY",
             "entry": price,
-            "tp": price * 1.005,
-            "sl": price * 0.995,
+            "tp": round(price * 1.005, 6),
+            "sl": round(price * 0.995, 6),
             "quality": "⚡ MEDIUM",
             "confidence": 70,
             "rsi": round(rsi, 2)
@@ -124,14 +125,14 @@ def generate_signal(symbol):
             "symbol": symbol,
             "direction": "SELL",
             "entry": price,
-            "tp": price * 0.995,
-            "sl": price * 1.005,
+            "tp": round(price * 0.995, 6),
+            "sl": round(price * 1.005, 6),
             "quality": "⚡ MEDIUM",
             "confidence": 70,
             "rsi": round(rsi, 2)
         }
 
-    # ⚠️ LOW (ALWAYS SEND)
+    # ⚠️ LOW QUALITY (ALWAYS SEND)
     else:
         direction = "BUY" if rsi < 50 else "SELL"
 
@@ -139,8 +140,8 @@ def generate_signal(symbol):
             "symbol": symbol,
             "direction": direction,
             "entry": price,
-            "tp": price * 1.002 if direction == "BUY" else price * 0.998,
-            "sl": price * 0.998 if direction == "BUY" else price * 1.002,
+            "tp": round(price * (1.002 if direction == "BUY" else 0.998), 6),
+            "sl": round(price * (0.998 if direction == "BUY" else 1.002), 6),
             "quality": "⚠️ LOW",
             "confidence": 50,
             "rsi": round(rsi, 2)
@@ -148,28 +149,7 @@ def generate_signal(symbol):
 
 
 # =========================
-# 🔁 BACKGROUND SCANNER
-# =========================
-def signal_loop():
-    global signals_store
-
-    while True:
-        new_signals = []
-
-        for pair in PAIRS:
-            signal = generate_signal(pair)
-            new_signals.append(signal)
-
-        signals_store = new_signals
-
-        print("✅ Signals updated:", new_signals)
-
-        # ⏱️ Adjust speed here (IMPORTANT for API limits)
-        time.sleep(30)  # every 30 seconds
-
-
-# =========================
-# 🌐 API ROUTES
+# 🌐 ROUTES
 # =========================
 @app.route("/")
 def home():
@@ -182,24 +162,25 @@ def home():
 
 @app.route("/signals")
 def signals():
-    return jsonify(signals_store)
+    results = []
+
+    for pair in PAIRS:
+        signal = generate_signal(pair)
+        results.append(signal)
+
+    return jsonify(results)
 
 
 @app.route("/status")
 def status():
     return jsonify({
         "running": True,
-        "signals_count": len(signals_store),
+        "pairs": len(PAIRS),
         "last_error": last_error
     })
 
 
 # =========================
-# 🚀 START BOT
+# 🚀 START APP
 # =========================
-if __name__ == "__main__":
-    thread = threading.Thread(target=signal_loop)
-    thread.daemon = True
-    thread.start()
-
-    app.run(host="0.0.0.0", port=10000)
+app.run(host="0.0.0.0", port=10000)
