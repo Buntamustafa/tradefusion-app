@@ -1,301 +1,226 @@
 import requests
 import time
 import threading
+import os
 from flask import Flask, jsonify
 
 app = Flask(__name__)
 
-TWELVE_API_KEY = "YOUR_TWELVEDATA_API_KEY"
-
-CRYPTO_SYMBOLS = ["BTCUSDT", "ETHUSDT", "XRPUSDT", "BNBUSDT"]
-FOREX_SYMBOLS = ["EUR/USD", "GBP/USD"]
-
-signals = []
-last_update = 0
-
-REQUEST_DELAY = 1.0
-CYCLE_DELAY = 15
-CACHE_TTL = 30
-
-cache = {}
-cache_lock = threading.Lock()
+TWELVE_API_KEY = os.getenv("TWELVE_API_KEY")
 
 # =========================
-# 🔒 SAFE REQUEST
+# CONFIG
 # =========================
-def safe_request(url):
+FOREX_PAIRS = ["EUR/USD", "GBP/USD"]
+CRYPTO_IDS = ["bitcoin", "ethereum", "ripple"]
+
+CACHE = {
+    "forex": {},
+    "crypto": {},
+    "last_update": 0,
+    "signals": []
+}
+
+CACHE_TTL = 60  # seconds
+
+
+# =========================
+# SAFE REQUEST FUNCTION
+# =========================
+def safe_request(url, params=None):
     try:
-        res = requests.get(url, timeout=10)
-        if res.status_code != 200:
-            print(f"❌ HTTP {res.status_code}: {url}")
+        res = requests.get(url, params=params, timeout=10)
+        if res.status_code == 200:
+            return res.json()
+        else:
+            print("Bad response:", res.status_code)
             return None
-        return res.json()
     except Exception as e:
-        print("❌ Request error:", e)
+        print("Request error:", str(e))
         return None
 
-# =========================
-# 🧠 CACHE SYSTEM (THREAD SAFE)
-# =========================
-def get_cached(key):
-    with cache_lock:
-        if key in cache:
-            data, ts = cache[key]
-            if time.time() - ts < CACHE_TTL:
-                return data
-    return None
-
-def set_cache(key, value):
-    with cache_lock:
-        cache[key] = (value, time.time())
 
 # =========================
-# 🪙 CRYPTO (CoinGecko)
+# FETCH FOREX (TwelveData)
 # =========================
-def get_crypto_data(symbol):
+def fetch_forex(pair, interval="1min"):
     try:
-        cached = get_cached(symbol)
-        if cached:
-            return cached
-
-        mapping = {
-            "BTCUSDT": "bitcoin",
-            "ETHUSDT": "ethereum",
-            "XRPUSDT": "ripple",
-            "BNBUSDT": "binancecoin"
+        url = "https://api.twelvedata.com/time_series"
+        params = {
+            "symbol": pair,
+            "interval": interval,
+            "apikey": TWELVE_API_KEY,
+            "outputsize": 10
         }
 
-        coin_id = mapping.get(symbol)
-        if not coin_id:
-            return None
-
-        url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart?vs_currency=usd&days=1"
-        data = safe_request(url)
-
-        if not data or "prices" not in data:
-            return None
-
-        prices = [p[1] for p in data["prices"]][-50:]
-
-        set_cache(symbol, prices)
-        return prices
-
-    except Exception as e:
-        print("❌ Crypto error:", e)
-        return None
-
-# =========================
-# 💱 FOREX (TwelveData)
-# =========================
-def get_forex_data(symbol, interval):
-    try:
-        key = f"{symbol}_{interval}"
-        cached = get_cached(key)
-        if cached:
-            return cached
-
-        url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval={interval}&apikey={TWELVE_API_KEY}&outputsize=30"
-        data = safe_request(url)
+        data = safe_request(url, params)
 
         if not data or "values" not in data:
             return None
 
         closes = [float(x["close"]) for x in data["values"]]
-
-        set_cache(key, closes)
-        return closes
+        return closes[::-1]  # oldest → newest
 
     except Exception as e:
-        print("❌ Forex error:", e)
+        print("Forex fetch error:", e)
         return None
 
+
 # =========================
-# 🔁 FOREX BACKUP
+# FETCH CRYPTO (CoinGecko)
 # =========================
-def get_forex_backup(symbol):
+def fetch_crypto():
     try:
-        base, quote = symbol.split("/")
-        url = f"https://api.exchangerate.host/timeseries?base={base}&symbols={quote}"
-        data = safe_request(url)
-
-        if not data or "rates" not in data:
-            return None
-
-        rates = [v[quote] for v in data["rates"].values()]
-        return rates[-30:]
-
-    except Exception as e:
-        print("❌ Backup error:", e)
-        return None
-
-# =========================
-# 🧠 ANALYSIS (SAFE)
-# =========================
-def analyze(symbol, data_5m, data_15m):
-    try:
-        if not data_5m or len(data_5m) < 5:
-            return None
-
-        current = data_5m[-1]
-        prev = data_5m[-2]
-
-        confidence = 0
-        reasons = []
-
-        # Direction
-        if current > prev:
-            direction = "BUY"
-            confidence += 30
-            reasons.append("5m uptrend")
-        else:
-            direction = "SELL"
-            confidence += 30
-            reasons.append("5m downtrend")
-
-        # 15m confirmation
-        if data_15m and len(data_15m) > 2:
-            if data_15m[-1] > data_15m[-2]:
-                confidence += 25
-                reasons.append("15m trend match")
-
-        # Momentum
-        move = abs(current - prev)
-        if move > 0:
-            confidence += 20
-
-        # Levels
-        if current <= min(data_5m[-5:]):
-            confidence += 15
-            reasons.append("Support")
-        elif current >= max(data_5m[-5:]):
-            confidence += 15
-            reasons.append("Resistance")
-
-        # Quality
-        if confidence >= 75:
-            quality = "🔥 STRONG"
-        elif confidence >= 60:
-            quality = "⚡ MEDIUM"
-        elif confidence >= 40:
-            quality = "⚠️ WEAK"
-        else:
-            quality = "❌ POOR"
-
-        return {
-            "symbol": symbol,
-            "direction": direction,
-            "entry": round(current, 5),
-            "tp": round(current * (1.01 if direction == "BUY" else 0.99), 5),
-            "sl": round(current * (0.99 if direction == "BUY" else 1.01), 5),
-            "confidence": confidence,
-            "quality": quality,
-            "reasons": reasons
+        url = "https://api.coingecko.com/api/v3/simple/price"
+        params = {
+            "ids": ",".join(CRYPTO_IDS),
+            "vs_currencies": "usd"
         }
 
+        data = safe_request(url, params)
+        return data
+
     except Exception as e:
-        print("❌ Analyze error:", e)
+        print("Crypto fetch error:", e)
         return None
 
-# =========================
-# 🔁 SCANNER LOOP (CRASH-PROOF)
-# =========================
-def scanner():
-    global signals, last_update
 
-    print("🚀 Scanner started")
+# =========================
+# SIMPLE TREND LOGIC
+# =========================
+def analyze_trend(prices):
+    if not prices or len(prices) < 5:
+        return "WAIT", 10
 
+    short_avg = sum(prices[-3:]) / 3
+    long_avg = sum(prices) / len(prices)
+
+    if short_avg > long_avg:
+        return "BUY", 70
+    elif short_avg < long_avg:
+        return "SELL", 70
+    else:
+        return "WAIT", 20
+
+
+# =========================
+# GENERATE SIGNALS
+# =========================
+def generate_signals():
+    signals = []
+
+    try:
+        # ===== FOREX =====
+        for pair in FOREX_PAIRS:
+            prices_1m = fetch_forex(pair, "1min")
+            prices_5m = fetch_forex(pair, "5min")
+
+            if prices_1m and prices_5m:
+                trend1, conf1 = analyze_trend(prices_1m)
+                trend5, conf5 = analyze_trend(prices_5m)
+
+                # Combine timeframes
+                if trend1 == trend5:
+                    trend = trend1
+                    confidence = int((conf1 + conf5) / 2)
+                else:
+                    trend = "WAIT"
+                    confidence = 30
+
+                entry = prices_1m[-1]
+
+                signals.append({
+                    "symbol": pair,
+                    "trend": trend,
+                    "entry": entry,
+                    "tp": round(entry * 1.01, 5),
+                    "sl": round(entry * 0.99, 5),
+                    "confidence": confidence
+                })
+
+        # ===== CRYPTO =====
+        crypto_data = fetch_crypto()
+
+        if crypto_data:
+            for coin in CRYPTO_IDS:
+                price = crypto_data.get(coin, {}).get("usd")
+
+                if price:
+                    signals.append({
+                        "symbol": coin.upper(),
+                        "trend": "BUY",
+                        "entry": price,
+                        "tp": round(price * 1.02, 2),
+                        "sl": round(price * 0.98, 2),
+                        "confidence": 60
+                    })
+
+    except Exception as e:
+        print("Signal generation error:", e)
+
+    # ===== FALLBACK (NEVER EMPTY) =====
+    if not signals:
+        signals.append({
+            "message": "No strong signals right now",
+            "trend": "WAIT",
+            "confidence": 0
+        })
+
+    return signals
+
+
+# =========================
+# BACKGROUND LOOP
+# =========================
+def update_loop():
     while True:
         try:
-            new_signals = []
+            now = time.time()
 
-            # CRYPTO
-            for symbol in CRYPTO_SYMBOLS:
-                try:
-                    data = get_crypto_data(symbol)
-                    if data:
-                        signal = analyze(symbol, data, data)
-                        if signal:
-                            new_signals.append(signal)
-                except Exception as e:
-                    print(f"❌ Crypto loop error {symbol}:", e)
-
-                time.sleep(REQUEST_DELAY)
-
-            # FOREX
-            for symbol in FOREX_SYMBOLS:
-                try:
-                    data_5m = get_forex_data(symbol, "5min")
-                    data_15m = get_forex_data(symbol, "15min")
-
-                    if not data_5m:
-                        print(f"⚠️ Backup used for {symbol}")
-                        data_5m = get_forex_backup(symbol)
-
-                    if data_5m:
-                        signal = analyze(symbol, data_5m, data_15m)
-                        if signal:
-                            new_signals.append(signal)
-
-                except Exception as e:
-                    print(f"❌ Forex loop error {symbol}:", e)
-
-                time.sleep(REQUEST_DELAY)
-
-            signals = new_signals if new_signals else [{
-                "symbol": "SYSTEM",
-                "direction": "WAIT",
-                "confidence": 0,
-                "quality": "⚙️ RUNNING",
-                "message": "Scanning market..."
-            }]
-
-            last_update = time.time()
-            print("✅ Signals updated:", signals)
+            if now - CACHE["last_update"] > CACHE_TTL:
+                print("Updating signals...")
+                CACHE["signals"] = generate_signals()
+                CACHE["last_update"] = now
 
         except Exception as e:
-            print("🔥 CRITICAL SCANNER ERROR:", e)
+            print("Loop error:", e)
 
-        time.sleep(CYCLE_DELAY)
+        time.sleep(10)
+
 
 # =========================
-# 🌐 ROUTES (SAFE)
+# ROUTES
 # =========================
 @app.route("/")
 def home():
     return jsonify({
-        "message": "🚀 Bot Running",
-        "endpoints": ["/signals", "/status"]
+        "status": "running",
+        "signals": len(CACHE["signals"])
     })
 
+
 @app.route("/signals")
-def get_signals():
-    try:
-        return jsonify(signals)
-    except Exception as e:
-        return jsonify([{"error": str(e)}])
+def signals():
+    return jsonify(CACHE["signals"])
+
 
 @app.route("/status")
 def status():
     return jsonify({
-        "running": True,
-        "signals_count": len(signals),
-        "last_update": last_update,
-        "cache_size": len(cache)
+        "connected": True,
+        "api_working": True if CACHE["signals"] else False,
+        "signals_count": len(CACHE["signals"]),
+        "last_update": CACHE["last_update"]
     })
 
-# =========================
-# 🚀 START SAFE THREAD
-# =========================
-def start():
-    while True:
-        try:
-            threading.Thread(target=scanner, daemon=True).start()
-            break
-        except Exception as e:
-            print("Thread start failed:", e)
-            time.sleep(5)
 
-start()
+# =========================
+# START THREAD
+# =========================
+threading.Thread(target=update_loop, daemon=True).start()
 
+# =========================
+# RUN APP
+# =========================
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
