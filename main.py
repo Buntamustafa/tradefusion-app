@@ -13,18 +13,20 @@ INTERVAL = "5min"
 signals = []
 last_update = 0
 
-# 🔒 Rate limit protection
-REQUEST_DELAY = 1.5   # seconds between calls
-CYCLE_DELAY = 20      # seconds between full scans
+# 🔒 RATE LIMIT SETTINGS (SAFE)
+REQUEST_DELAY = 1.2   # seconds between each API call
+CYCLE_DELAY = 15      # seconds between full scans
 
+# 📊 Fetch market data
 def get_price_data(symbol):
     url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval={INTERVAL}&apikey={API_KEY}&outputsize=20"
     
     try:
-        response = requests.get(url)
-        data = response.json()
+        res = requests.get(url, timeout=10)
+        data = res.json()
 
         if "values" not in data:
+            print(f"API issue for {symbol}: {data}")
             return None
 
         return data["values"]
@@ -34,6 +36,7 @@ def get_price_data(symbol):
         return None
 
 
+# 🧠 Signal scoring system (NO more empty signals)
 def calculate_signal(symbol, data):
     try:
         closes = [float(c["close"]) for c in data]
@@ -42,41 +45,65 @@ def calculate_signal(symbol, data):
         prev = closes[1]
 
         confidence = 0
+        reasons = []
 
-        # Simple logic (upgradeable)
+        # 📈 Trend direction
         if current > prev:
             direction = "BUY"
-            confidence += 40
+            confidence += 30
+            reasons.append("Short-term uptrend")
         else:
             direction = "SELL"
-            confidence += 40
-
-        # Momentum
-        if abs(current - prev) > 0.5:
             confidence += 30
+            reasons.append("Short-term downtrend")
 
-        # Fake RSI logic (replace later with real RSI)
-        if current < min(closes[-5:]):
+        # ⚡ Momentum strength
+        move = abs(current - prev)
+        if move > 0.5:
+            confidence += 25
+            reasons.append("Strong momentum")
+        elif move > 0.2:
+            confidence += 15
+            reasons.append("Moderate momentum")
+
+        # 📉 Simple support/resistance idea
+        recent_low = min(closes[-5:])
+        recent_high = max(closes[-5:])
+
+        if current <= recent_low:
             confidence += 20
+            reasons.append("Near support")
+        elif current >= recent_high:
+            confidence += 20
+            reasons.append("Near resistance")
 
-        # 🚫 Filter weak signals
-        if confidence < 60:
-            return None
+        # 🎯 Quality grading (NO filtering)
+        if confidence >= 75:
+            quality = "🔥 STRONG"
+        elif confidence >= 60:
+            quality = "⚡ MEDIUM"
+        elif confidence >= 40:
+            quality = "⚠️ WEAK"
+        else:
+            quality = "❌ POOR"
 
         return {
             "symbol": symbol,
             "direction": direction,
-            "entry": current,
-            "tp": round(current * 1.01, 2),
-            "sl": round(current * 0.99, 2),
+            "entry": round(current, 4),
+            "tp": round(current * (1.01 if direction == "BUY" else 0.99), 4),
+            "sl": round(current * (0.99 if direction == "BUY" else 1.01), 4),
             "confidence": confidence,
-            "quality": "🔥 STRONG" if confidence > 75 else "⚡ MEDIUM"
+            "quality": quality,
+            "reasons": reasons
         }
 
-    except:
+    except Exception as e:
+        print("Signal error:", e)
         return None
 
 
+# 🔁 Main scanner loop (RATE SAFE)
 def scanner():
     global signals, last_update
 
@@ -91,7 +118,7 @@ def scanner():
                 if signal:
                     new_signals.append(signal)
 
-            # 🔒 IMPORTANT: avoid rate limit
+            # 🔒 Prevent API ban
             time.sleep(REQUEST_DELAY)
 
         signals = new_signals
@@ -99,14 +126,23 @@ def scanner():
 
         print("Updated signals:", signals)
 
-        # 🔁 Wait before next scan
+        # ⏳ Wait before next scan
         time.sleep(CYCLE_DELAY)
+
+
+# 🌐 Routes
+@app.route("/")
+def home():
+    return jsonify({
+        "message": "🚀 Trading Bot Running",
+        "endpoints": ["/signals", "/status"]
+    })
 
 
 @app.route("/signals")
 def get_signals():
     if not signals:
-        return jsonify([{"message": "⏳ Waiting for strong signals..."}])
+        return jsonify([{"message": "⏳ Gathering market data..."}])
     return jsonify(signals)
 
 
@@ -119,8 +155,9 @@ def status():
     })
 
 
-# 🚀 Start scanner in background
+# 🚀 Start background scanner
 threading.Thread(target=scanner, daemon=True).start()
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
