@@ -8,35 +8,33 @@ PAIRS = ["BTCUSDT", "ETHUSDT", "XRPUSDT", "BNBUSDT", "SOLUSDT"]
 last_error = None
 
 # =========================
-# 📊 DATA (BINANCE FIXED)
+# 📊 DATA (CRYPTOCOMPARE)
 # =========================
-def get_klines(symbol, interval="1m", limit=100):
+def get_klines(symbol, limit=100):
     global last_error
 
-    urls = [
-        f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}",
-        f"https://api1.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}",
-        f"https://api2.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}",
-    ]
+    try:
+        base = symbol.replace("USDT", "")
 
-    for url in urls:
-        try:
-            res = requests.get(url, timeout=10).json()
+        url = f"https://min-api.cryptocompare.com/data/v2/histominute?fsym={base}&tsym=USDT&limit={limit}"
+        res = requests.get(url, timeout=10).json()
 
-            if isinstance(res, list):
-                closes = [float(x[4]) for x in res]
-                highs = [float(x[2]) for x in res]
-                lows = [float(x[3]) for x in res]
-                volumes = [float(x[5]) for x in res]
-
-                return closes, highs, lows, volumes
-
+        if res.get("Response") != "Success":
             last_error = res
+            return None
 
-        except Exception as e:
-            last_error = str(e)
+        data = res["Data"]["Data"]
 
-    return None
+        closes = [x["close"] for x in data]
+        highs = [x["high"] for x in data]
+        lows = [x["low"] for x in data]
+        volumes = [x["volumeto"] for x in data]
+
+        return closes, highs, lows, volumes
+
+    except Exception as e:
+        last_error = str(e)
+        return None
 
 
 # =========================
@@ -141,7 +139,7 @@ def get_quality(score):
 
 
 # =========================
-# 🚨 ENGINE
+# 🚨 STRATEGY ENGINE
 # =========================
 def strat_engine(symbol):
     data = get_klines(symbol)
@@ -181,7 +179,7 @@ def strat_engine(symbol):
             "quality": get_quality(score)
         }
 
-    # 🔥 Strategies (relaxed so signals always appear)
+    # 🔥 Strategies (relaxed)
     if r < 40:
         signals.append(build("Range_RSI_Liquidity", "BUY"))
 
@@ -191,8 +189,7 @@ def strat_engine(symbol):
     if br:
         signals.append(build("Breakout_Volume", br))
 
-    if trend:
-        signals.append(build("MTF_RSI_Trend", trend))
+    signals.append(build("MTF_RSI_Trend", trend))
 
     if sweep:
         signals.append(build("SMC_Sweep_BOS", sweep))
@@ -205,11 +202,11 @@ def strat_engine(symbol):
 
     # 🔥 NEVER EMPTY
     if not signals:
-        fallback_direction = "BUY" if r < 50 else "SELL"
+        fallback = "BUY" if r < 50 else "SELL"
         signals.append({
             "symbol": symbol,
             "strategy": "Fallback",
-            "direction": fallback_direction,
+            "direction": fallback,
             "confidence": 50,
             "quality": "⚠️ LOW"
         })
@@ -220,6 +217,14 @@ def strat_engine(symbol):
 # =========================
 # 🌐 ROUTES
 # =========================
+@app.route("/")
+def home():
+    return jsonify({
+        "status": "🔥 Bot running (CryptoCompare)",
+        "pairs": PAIRS
+    })
+
+
 @app.route("/signals")
 def signals():
     all_signals = []
@@ -231,16 +236,8 @@ def signals():
 @app.route("/status")
 def status():
     return jsonify({
-        "status": "running",
+        "running": True,
         "last_error": last_error
-    })
-
-
-@app.route("/")
-def home():
-    return jsonify({
-        "message": "🔥 Multi-Strategy Binance Bot Active",
-        "pairs": PAIRS
     })
 
 
