@@ -14,41 +14,37 @@ CRYPTO_IDS = ["bitcoin", "ethereum", "ripple"]
 CACHE = {
     "signals": [],
     "last_update": 0,
-    "cycle": 0
+    "last_trend": {}
 }
 
 CACHE_TTL = 120
 
 
 # =========================
-# SAFE REQUEST
+# REQUEST
 # =========================
 def safe_request(url, params=None):
     try:
         r = requests.get(url, params=params, timeout=10)
         if r.status_code == 200:
             return r.json()
-        else:
-            print("Bad response:", r.status_code)
-            return None
-    except Exception as e:
-        print("Request error:", e)
+    except:
         return None
 
 
 # =========================
-# FOREX
+# FOREX FETCH
 # =========================
-def fetch_twelve(pair):
+def fetch_twelve(pair, interval="1min"):
     if not TWELVE_API_KEY:
         return None
 
     url = "https://api.twelvedata.com/time_series"
     params = {
         "symbol": pair,
-        "interval": "1min",
+        "interval": interval,
         "apikey": TWELVE_API_KEY,
-        "outputsize": 5
+        "outputsize": 20
     }
 
     data = safe_request(url, params)
@@ -57,88 +53,93 @@ def fetch_twelve(pair):
     return None
 
 
-def fetch_alpha(pair):
-    if not ALPHA_API_KEY:
-        return None
-
-    base, quote = pair.split("/")
-    url = "https://www.alphavantage.co/query"
-    params = {
-        "function": "FX_INTRADAY",
-        "from_symbol": base,
-        "to_symbol": quote,
-        "interval": "5min",
-        "apikey": ALPHA_API_KEY
-    }
-
-    data = safe_request(url, params)
-    key = "Time Series FX (5min)"
-
-    if data and key in data:
-        values = list(data[key].values())[:5]
-        return [float(v["4. close"]) for v in values][::-1]
-
-    return None
-
-
 # =========================
-# CRYPTO APIs
+# CRYPTO (MULTI API)
 # =========================
 def fetch_coingecko():
     url = "https://api.coingecko.com/api/v3/simple/price"
-    params = {
-        "ids": ",".join(CRYPTO_IDS),
-        "vs_currencies": "usd"
-    }
+    params = {"ids": ",".join(CRYPTO_IDS), "vs_currencies": "usd"}
     return safe_request(url, params)
 
 
 def fetch_cryptocompare():
     url = "https://min-api.cryptocompare.com/data/pricemulti"
-    symbols = ",".join([c[:3].upper() for c in CRYPTO_IDS])
-    params = {
-        "fsyms": symbols,
-        "tsyms": "USD"
-    }
+    params = {"fsyms": "BTC,ETH,XRP", "tsyms": "USD"}
     return safe_request(url, params)
 
 
 def synthetic_price():
-    return round(100 + (time.time() % 50), 2)
+    return 100 + (time.time() % 50)
 
 
 # =========================
-# ANALYSIS
+# INDICATORS
 # =========================
-def analyze(prices):
-    if not prices:
+def ema(prices, period=10):
+    k = 2 / (period + 1)
+    ema_val = prices[0]
+    for price in prices:
+        ema_val = price * k + ema_val * (1 - k)
+    return ema_val
+
+
+def rsi(prices, period=14):
+    gains, losses = [], []
+
+    for i in range(1, len(prices)):
+        diff = prices[i] - prices[i - 1]
+        if diff > 0:
+            gains.append(diff)
+        else:
+            losses.append(abs(diff))
+
+    avg_gain = sum(gains[-period:]) / period if gains else 0.001
+    avg_loss = sum(losses[-period:]) / period if losses else 0.001
+
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
+
+
+# =========================
+# SMART ANALYSIS
+# =========================
+def analyze(prices_1m, prices_5m, symbol):
+    if not prices_1m or not prices_5m:
         return "WAIT", 10
 
-    avg = sum(prices) / len(prices)
-    last = prices[-1]
+    ema1 = ema(prices_1m)
+    ema5 = ema(prices_5m)
+    current = prices_1m[-1]
+    rsi_val = rsi(prices_1m)
 
-    if last > avg:
-        return "BUY", 70
-    elif last < avg:
-        return "SELL", 70
-    return "WAIT", 20
-
-
-# =========================
-# TP/SL FIXED LOGIC
-# =========================
-def calculate_tp_sl(entry, trend):
-    if trend == "BUY":
-        tp = entry * 1.01
-        sl = entry * 0.99
-    elif trend == "SELL":
-        tp = entry * 0.99   # BELOW entry
-        sl = entry * 1.01   # ABOVE entry
+    # Trend confirmation
+    if current > ema1 and current > ema5 and rsi_val < 70:
+        trend = "BUY"
+    elif current < ema1 and current < ema5 and rsi_val > 30:
+        trend = "SELL"
     else:
-        tp = entry
-        sl = entry
+        trend = "WAIT"
 
-    return round(tp, 5), round(sl, 5)
+    # Anti-flip (lock previous signal)
+    last = CACHE["last_trend"].get(symbol)
+    if last and last != trend and trend != "WAIT":
+        trend = "WAIT"
+
+    CACHE["last_trend"][symbol] = trend
+
+    confidence = 80 if trend != "WAIT" else 40
+    return trend, confidence
+
+
+# =========================
+# TP / SL
+# =========================
+def tp_sl(entry, trend):
+    if trend == "BUY":
+        return entry * 1.02, entry * 0.99
+    elif trend == "SELL":
+        return entry * 0.98, entry * 1.01
+    return entry, entry
 
 
 # =========================
@@ -146,41 +147,32 @@ def calculate_tp_sl(entry, trend):
 # =========================
 def generate_signals():
     signals = []
-    CACHE["cycle"] += 1
-
-    print("🔄 Generating signals...")
 
     # ===== FOREX =====
     for pair in FOREX_PAIRS:
+        prices_1m = fetch_twelve(pair, "1min")
+        prices_5m = fetch_twelve(pair, "5min")
 
-        if CACHE["cycle"] % 2 == 0:
-            prices = fetch_twelve(pair) or fetch_alpha(pair)
-        else:
-            prices = fetch_alpha(pair) or fetch_twelve(pair)
+        if not prices_1m or not prices_5m:
+            prices_1m = [1 + i * 0.001 for i in range(20)]
+            prices_5m = prices_1m
 
-        if not prices:
-            prices = [1 + i * 0.001 for i in range(5)]
-
-        trend, confidence = analyze(prices)
-        entry = prices[-1]
-
-        tp, sl = calculate_tp_sl(entry, trend)
+        trend, confidence = analyze(prices_1m, prices_5m, pair)
+        entry = prices_1m[-1]
+        tp, sl = tp_sl(entry, trend)
 
         signals.append({
             "symbol": pair,
             "trend": trend,
             "entry": round(entry, 5),
-            "tp": tp,
-            "sl": sl,
+            "tp": round(tp, 5),
+            "sl": round(sl, 5),
             "confidence": confidence
         })
 
     # ===== CRYPTO =====
     cg = fetch_coingecko()
-    cc = None
-
-    if not cg:
-        cc = fetch_cryptocompare()
+    cc = None if cg else fetch_cryptocompare()
 
     for coin in CRYPTO_IDS:
         price = None
@@ -195,14 +187,14 @@ def generate_signals():
         if not price:
             price = synthetic_price()
 
-        tp, sl = calculate_tp_sl(price, "BUY")
+        tp, sl = tp_sl(price, "BUY")
 
         signals.append({
             "symbol": coin.upper(),
             "trend": "BUY",
             "entry": round(price, 2),
-            "tp": tp,
-            "sl": sl,
+            "tp": round(tp, 2),
+            "sl": round(sl, 2),
             "confidence": 60
         })
 
@@ -214,13 +206,9 @@ def generate_signals():
 # =========================
 def update_if_needed():
     now = time.time()
-
     if now - CACHE["last_update"] > CACHE_TTL:
-        try:
-            CACHE["signals"] = generate_signals()
-            CACHE["last_update"] = now
-        except Exception as e:
-            print("Update error:", e)
+        CACHE["signals"] = generate_signals()
+        CACHE["last_update"] = now
 
 
 # =========================
@@ -241,8 +229,7 @@ def signals():
 def status():
     return jsonify({
         "signals": len(CACHE["signals"]),
-        "last_update": CACHE["last_update"],
-        "cycle": CACHE["cycle"]
+        "last_update": CACHE["last_update"]
     })
 
 
