@@ -5,15 +5,9 @@ from flask import Flask, jsonify
 
 app = Flask(__name__)
 
-# =========================
-# API KEYS
-# =========================
 TWELVE_API_KEY = os.getenv("TWELVE_API_KEY")
 ALPHA_API_KEY = os.getenv("ALPHA_API_KEY")
 
-# =========================
-# CONFIG
-# =========================
 FOREX_PAIRS = ["EUR/USD", "GBP/USD"]
 CRYPTO_IDS = ["bitcoin", "ethereum", "ripple"]
 
@@ -23,7 +17,8 @@ CACHE = {
     "cycle": 0
 }
 
-CACHE_TTL = 120  # safer for rate limits
+CACHE_TTL = 120
+
 
 # =========================
 # SAFE REQUEST
@@ -40,8 +35,9 @@ def safe_request(url, params=None):
         print("Request error:", e)
         return None
 
+
 # =========================
-# FOREX - TWELVEDATA
+# FOREX
 # =========================
 def fetch_twelve(pair):
     if not TWELVE_API_KEY:
@@ -60,9 +56,7 @@ def fetch_twelve(pair):
         return [float(x["close"]) for x in data["values"]][::-1]
     return None
 
-# =========================
-# FOREX - ALPHA VANTAGE
-# =========================
+
 def fetch_alpha(pair):
     if not ALPHA_API_KEY:
         return None
@@ -86,10 +80,11 @@ def fetch_alpha(pair):
 
     return None
 
+
 # =========================
-# CRYPTO - COINGECKO
+# CRYPTO APIs
 # =========================
-def fetch_crypto():
+def fetch_coingecko():
     url = "https://api.coingecko.com/api/v3/simple/price"
     params = {
         "ids": ",".join(CRYPTO_IDS),
@@ -97,12 +92,20 @@ def fetch_crypto():
     }
     return safe_request(url, params)
 
-# =========================
-# FALLBACK (NO API)
-# =========================
-def synthetic_prices():
-    base = 1.0 + (time.time() % 10) / 100
-    return [base + i * 0.001 for i in range(5)]
+
+def fetch_cryptocompare():
+    url = "https://min-api.cryptocompare.com/data/pricemulti"
+    symbols = ",".join([c[:3].upper() for c in CRYPTO_IDS])
+    params = {
+        "fsyms": symbols,
+        "tsyms": "USD"
+    }
+    return safe_request(url, params)
+
+
+def synthetic_price():
+    return round(100 + (time.time() % 50), 2)
+
 
 # =========================
 # ANALYSIS
@@ -120,6 +123,24 @@ def analyze(prices):
         return "SELL", 70
     return "WAIT", 20
 
+
+# =========================
+# TP/SL FIXED LOGIC
+# =========================
+def calculate_tp_sl(entry, trend):
+    if trend == "BUY":
+        tp = entry * 1.01
+        sl = entry * 0.99
+    elif trend == "SELL":
+        tp = entry * 0.99   # BELOW entry
+        sl = entry * 1.01   # ABOVE entry
+    else:
+        tp = entry
+        sl = entry
+
+    return round(tp, 5), round(sl, 5)
+
+
 # =========================
 # GENERATE SIGNALS
 # =========================
@@ -127,65 +148,69 @@ def generate_signals():
     signals = []
     CACHE["cycle"] += 1
 
-    print("🔄 Generating signals... Cycle:", CACHE["cycle"])
+    print("🔄 Generating signals...")
 
+    # ===== FOREX =====
     for pair in FOREX_PAIRS:
 
-        # Rotate APIs to avoid limits
         if CACHE["cycle"] % 2 == 0:
             prices = fetch_twelve(pair) or fetch_alpha(pair)
         else:
             prices = fetch_alpha(pair) or fetch_twelve(pair)
 
-        # fallback if both fail
         if not prices:
-            print("⚠️ Using synthetic data for", pair)
-            prices = synthetic_prices()
+            prices = [1 + i * 0.001 for i in range(5)]
 
         trend, confidence = analyze(prices)
         entry = prices[-1]
+
+        tp, sl = calculate_tp_sl(entry, trend)
 
         signals.append({
             "symbol": pair,
             "trend": trend,
             "entry": round(entry, 5),
-            "tp": round(entry * 1.01, 5),
-            "sl": round(entry * 0.99, 5),
+            "tp": tp,
+            "sl": sl,
             "confidence": confidence
         })
 
     # ===== CRYPTO =====
-    crypto = fetch_crypto()
+    cg = fetch_coingecko()
+    cc = None
 
-    if crypto:
-        for coin in CRYPTO_IDS:
-            price = crypto.get(coin, {}).get("usd")
-            if price:
-                signals.append({
-                    "symbol": coin.upper(),
-                    "trend": "BUY",
-                    "entry": price,
-                    "tp": round(price * 1.02, 2),
-                    "sl": round(price * 0.98, 2),
-                    "confidence": 60
-                })
+    if not cg:
+        cc = fetch_cryptocompare()
 
-    # FINAL SAFETY (NEVER EMPTY)
-    if not signals:
-        signals = [{
-            "symbol": "SYSTEM",
-            "trend": "WAIT",
-            "entry": 0,
-            "tp": 0,
-            "sl": 0,
-            "confidence": 0
-        }]
+    for coin in CRYPTO_IDS:
+        price = None
 
-    print("✅ Signals:", signals)
+        if cg:
+            price = cg.get(coin, {}).get("usd")
+
+        if not price and cc:
+            symbol = coin[:3].upper()
+            price = cc.get(symbol, {}).get("USD")
+
+        if not price:
+            price = synthetic_price()
+
+        tp, sl = calculate_tp_sl(price, "BUY")
+
+        signals.append({
+            "symbol": coin.upper(),
+            "trend": "BUY",
+            "entry": round(price, 2),
+            "tp": tp,
+            "sl": sl,
+            "confidence": 60
+        })
+
     return signals
 
+
 # =========================
-# UPDATE (NO THREAD)
+# UPDATE
 # =========================
 def update_if_needed():
     now = time.time()
@@ -195,7 +220,8 @@ def update_if_needed():
             CACHE["signals"] = generate_signals()
             CACHE["last_update"] = now
         except Exception as e:
-            print("❌ Update error:", e)
+            print("Update error:", e)
+
 
 # =========================
 # ROUTES
@@ -204,25 +230,21 @@ def update_if_needed():
 def home():
     return jsonify({"status": "running"})
 
+
 @app.route("/signals")
 def signals():
     update_if_needed()
     return jsonify(CACHE["signals"])
 
+
 @app.route("/status")
 def status():
     return jsonify({
-        "api_keys": {
-            "twelve": bool(TWELVE_API_KEY),
-            "alpha": bool(ALPHA_API_KEY)
-        },
-        "signals_count": len(CACHE["signals"]),
+        "signals": len(CACHE["signals"]),
         "last_update": CACHE["last_update"],
         "cycle": CACHE["cycle"]
     })
 
-# =========================
-# RUN
-# =========================
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
