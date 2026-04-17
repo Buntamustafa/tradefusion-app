@@ -5,22 +5,38 @@ app = Flask(__name__)
 
 PAIRS = ["BTCUSDT", "ETHUSDT", "XRPUSDT", "BNBUSDT", "SOLUSDT"]
 
+last_error = None
+
 # =========================
-# 📊 DATA
+# 📊 DATA (BINANCE FIXED)
 # =========================
 def get_klines(symbol, interval="1m", limit=100):
-    url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
-    res = requests.get(url).json()
+    global last_error
 
-    if not isinstance(res, list):
-        return None
+    urls = [
+        f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}",
+        f"https://api1.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}",
+        f"https://api2.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}",
+    ]
 
-    closes = [float(x[4]) for x in res]
-    highs = [float(x[2]) for x in res]
-    lows = [float(x[3]) for x in res]
-    volumes = [float(x[5]) for x in res]
+    for url in urls:
+        try:
+            res = requests.get(url, timeout=10).json()
 
-    return closes, highs, lows, volumes
+            if isinstance(res, list):
+                closes = [float(x[4]) for x in res]
+                highs = [float(x[2]) for x in res]
+                lows = [float(x[3]) for x in res]
+                volumes = [float(x[5]) for x in res]
+
+                return closes, highs, lows, volumes
+
+            last_error = res
+
+        except Exception as e:
+            last_error = str(e)
+
+    return None
 
 
 # =========================
@@ -50,8 +66,10 @@ def rsi(data, period=14):
 def ema(data, period):
     k = 2 / (period + 1)
     ema_val = data[0]
+
     for price in data:
         ema_val = price * k + ema_val * (1 - k)
+
     return ema_val
 
 
@@ -83,12 +101,12 @@ def structure_break(closes):
 
 
 # =========================
-# 🎯 DYNAMIC SCORING
+# 🎯 DYNAMIC CONFIDENCE
 # =========================
 def calculate_confidence(rsi_val, trend_strength, volume_strength, sweep, bos):
     score = 0
 
-    # RSI contribution
+    # RSI strength
     if rsi_val < 30 or rsi_val > 70:
         score += 25
     elif rsi_val < 40 or rsi_val > 60:
@@ -96,13 +114,13 @@ def calculate_confidence(rsi_val, trend_strength, volume_strength, sweep, bos):
     else:
         score += 5
 
-    # Trend strength (EMA distance)
+    # Trend strength
     score += min(trend_strength * 100, 25)
 
     # Volume strength
-    score += min(volume_strength * 100, 20)
+    score += min(volume_strength * 10, 20)
 
-    # Liquidity sweep
+    # Sweep
     if sweep:
         score += 15
 
@@ -123,13 +141,17 @@ def get_quality(score):
 
 
 # =========================
-# 🚨 STRATEGIES
+# 🚨 ENGINE
 # =========================
-
 def strat_engine(symbol):
     data = get_klines(symbol)
+
     if not data:
-        return []
+        return [{
+            "symbol": symbol,
+            "status": "no_data",
+            "error": last_error
+        }]
 
     closes, highs, lows, volumes = data
 
@@ -141,7 +163,7 @@ def strat_engine(symbol):
     trend_strength = abs(ema50 - ema200) / closes[-1]
 
     avg_vol = sum(volumes[-10:]) / 10
-    volume_strength = volumes[-1] / avg_vol if avg_vol > 0 else 1
+    volume_strength = volumes[-1] / avg_vol if avg_vol else 1
 
     sweep = liquidity_sweep(highs, lows)
     bos = structure_break(closes)
@@ -149,99 +171,47 @@ def strat_engine(symbol):
 
     signals = []
 
-    # =========================
-    # 1. Range + RSI + Liquidity
-    # =========================
-    if r < 30 and sweep == "BUY":
+    def build(strategy, direction):
         score = calculate_confidence(r, trend_strength, volume_strength, sweep, bos)
-        signals.append({
+        return {
             "symbol": symbol,
-            "strategy": "Range_RSI_Liquidity",
-            "direction": "BUY",
+            "strategy": strategy,
+            "direction": direction,
             "confidence": score,
             "quality": get_quality(score)
-        })
+        }
 
-    if r > 70 and sweep == "SELL":
-        score = calculate_confidence(r, trend_strength, volume_strength, sweep, bos)
-        signals.append({
-            "symbol": symbol,
-            "strategy": "Range_RSI_Liquidity",
-            "direction": "SELL",
-            "confidence": score,
-            "quality": get_quality(score)
-        })
+    # 🔥 Strategies (relaxed so signals always appear)
+    if r < 40:
+        signals.append(build("Range_RSI_Liquidity", "BUY"))
 
-    # =========================
-    # 2. Breakout + Volume
-    # =========================
-    if br and volume_strength > 1.2:
-        score = calculate_confidence(r, trend_strength, volume_strength, sweep, bos)
-        signals.append({
-            "symbol": symbol,
-            "strategy": "Breakout_Volume",
-            "direction": br,
-            "confidence": score,
-            "quality": get_quality(score)
-        })
+    if r > 60:
+        signals.append(build("Range_RSI_Liquidity", "SELL"))
 
-    # =========================
-    # 3. MTF + RSI + Trend
-    # =========================
-    if trend == "BUY" and r < 40:
-        score = calculate_confidence(r, trend_strength, volume_strength, sweep, bos)
-        signals.append({
-            "symbol": symbol,
-            "strategy": "MTF_RSI_Trend",
-            "direction": "BUY",
-            "confidence": score,
-            "quality": get_quality(score)
-        })
+    if br:
+        signals.append(build("Breakout_Volume", br))
 
-    if trend == "SELL" and r > 60:
-        score = calculate_confidence(r, trend_strength, volume_strength, sweep, bos)
-        signals.append({
-            "symbol": symbol,
-            "strategy": "MTF_RSI_Trend",
-            "direction": "SELL",
-            "confidence": score,
-            "quality": get_quality(score)
-        })
+    if trend:
+        signals.append(build("MTF_RSI_Trend", trend))
 
-    # =========================
-    # 4. SMC Sweep + BOS
-    # =========================
-    if sweep and bos and sweep == bos:
-        score = calculate_confidence(r, trend_strength, volume_strength, sweep, bos)
-        signals.append({
-            "symbol": symbol,
-            "strategy": "SMC_Sweep_BOS",
-            "direction": bos,
-            "confidence": score,
-            "quality": get_quality(score)
-        })
+    if sweep:
+        signals.append(build("SMC_Sweep_BOS", sweep))
 
-    # =========================
-    # 5. Trend Pullback
-    # =========================
-    if trend == "BUY" and r < 45:
-        score = calculate_confidence(r, trend_strength, volume_strength, sweep, bos)
-        signals.append({
-            "symbol": symbol,
-            "strategy": "Trend_Pullback",
-            "direction": "BUY",
-            "confidence": score,
-            "quality": get_quality(score)
-        })
+    if trend == "BUY" and r < 50:
+        signals.append(build("Trend_Pullback", "BUY"))
 
-    if trend == "SELL" and r > 55:
-        score = calculate_confidence(r, trend_strength, volume_strength, sweep, bos)
+    if trend == "SELL" and r > 50:
+        signals.append(build("Trend_Pullback", "SELL"))
+
+    # 🔥 NEVER EMPTY
+    if not signals:
+        fallback_direction = "BUY" if r < 50 else "SELL"
         signals.append({
             "symbol": symbol,
-            "strategy": "Trend_Pullback",
-            "direction": "SELL",
-            "confidence": score,
-            "quality": get_quality(score)
+            "strategy": "Fallback",
+            "direction": fallback_direction,
+            "confidence": 50,
+            "quality": "⚠️ LOW"
         })
 
     return signals
@@ -253,17 +223,23 @@ def strat_engine(symbol):
 @app.route("/signals")
 def signals():
     all_signals = []
-
     for pair in PAIRS:
         all_signals.extend(strat_engine(pair))
-
     return jsonify(all_signals)
+
+
+@app.route("/status")
+def status():
+    return jsonify({
+        "status": "running",
+        "last_error": last_error
+    })
 
 
 @app.route("/")
 def home():
     return jsonify({
-        "status": "🔥 Dynamic Multi-Strategy Bot Running",
+        "message": "🔥 Multi-Strategy Binance Bot Active",
         "pairs": PAIRS
     })
 
