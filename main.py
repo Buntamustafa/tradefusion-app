@@ -1,237 +1,177 @@
 import requests
 import time
+import threading
 import os
 from flask import Flask, jsonify
 
 app = Flask(__name__)
 
-TWELVE_API_KEY = os.getenv("TWELVE_API_KEY")
-ALPHA_API_KEY = os.getenv("ALPHA_API_KEY")
+# ================= CONFIG =================
+TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY")
+REFRESH_INTERVAL = 60  # seconds
 
-FOREX_PAIRS = ["EUR/USD", "GBP/USD"]
-CRYPTO_IDS = ["bitcoin", "ethereum", "ripple"]
-
-CACHE = {
-    "signals": [],
-    "last_update": 0,
-    "last_trend": {}
+# ================= GLOBAL STATE =================
+signals_cache = []
+last_update = 0
+bot_status = {
+    "running": True,
+    "last_error": None,
+    "last_update": None
 }
 
-CACHE_TTL = 120
+# ================= FETCH FUNCTIONS =================
 
-
-# =========================
-# REQUEST
-# =========================
-def safe_request(url, params=None):
+def fetch_forex(pair):
     try:
-        r = requests.get(url, params=params, timeout=10)
-        if r.status_code == 200:
-            return r.json()
-    except:
+        url = f"https://api.twelvedata.com/time_series?symbol={pair}&interval=1min&outputsize=20&apikey={TWELVEDATA_API_KEY}"
+        r = requests.get(url, timeout=10)
+        data = r.json()
+
+        if "values" not in data:
+            return None
+
+        closes = [float(x["close"]) for x in data["values"]]
+
+        return closes[::-1]  # oldest -> newest
+
+    except Exception as e:
+        bot_status["last_error"] = str(e)
         return None
 
 
-# =========================
-# FOREX FETCH
-# =========================
-def fetch_twelve(pair, interval="1min"):
-    if not TWELVE_API_KEY:
+def fetch_crypto(coin_id):
+    try:
+        url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart?vs_currency=usd&days=1"
+        r = requests.get(url, timeout=10)
+        data = r.json()
+
+        prices = [p[1] for p in data["prices"]]
+
+        return prices[-20:]
+
+    except Exception as e:
+        bot_status["last_error"] = str(e)
         return None
 
-    url = "https://api.twelvedata.com/time_series"
-    params = {
-        "symbol": pair,
-        "interval": interval,
-        "apikey": TWELVE_API_KEY,
-        "outputsize": 20
-    }
 
-    data = safe_request(url, params)
-    if data and "values" in data:
-        return [float(x["close"]) for x in data["values"]][::-1]
-    return None
+# ================= STRATEGY =================
 
+def calculate_signal(prices, symbol):
+    if not prices or len(prices) < 10:
+        return {"symbol": symbol, "status": "no_data"}
 
-# =========================
-# CRYPTO (MULTI API)
-# =========================
-def fetch_coingecko():
-    url = "https://api.coingecko.com/api/v3/simple/price"
-    params = {"ids": ",".join(CRYPTO_IDS), "vs_currencies": "usd"}
-    return safe_request(url, params)
+    current = prices[-1]
+    ma_short = sum(prices[-5:]) / 5
+    ma_long = sum(prices[-10:]) / 10
 
-
-def fetch_cryptocompare():
-    url = "https://min-api.cryptocompare.com/data/pricemulti"
-    params = {"fsyms": "BTC,ETH,XRP", "tsyms": "USD"}
-    return safe_request(url, params)
-
-
-def synthetic_price():
-    return 100 + (time.time() % 50)
-
-
-# =========================
-# INDICATORS
-# =========================
-def ema(prices, period=10):
-    k = 2 / (period + 1)
-    ema_val = prices[0]
-    for price in prices:
-        ema_val = price * k + ema_val * (1 - k)
-    return ema_val
-
-
-def rsi(prices, period=14):
-    gains, losses = [], []
-
-    for i in range(1, len(prices)):
-        diff = prices[i] - prices[i - 1]
-        if diff > 0:
-            gains.append(diff)
-        else:
-            losses.append(abs(diff))
-
-    avg_gain = sum(gains[-period:]) / period if gains else 0.001
-    avg_loss = sum(losses[-period:]) / period if losses else 0.001
-
-    rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
-
-
-# =========================
-# SMART ANALYSIS
-# =========================
-def analyze(prices_1m, prices_5m, symbol):
-    if not prices_1m or not prices_5m:
-        return "WAIT", 10
-
-    ema1 = ema(prices_1m)
-    ema5 = ema(prices_5m)
-    current = prices_1m[-1]
-    rsi_val = rsi(prices_1m)
-
-    # Trend confirmation
-    if current > ema1 and current > ema5 and rsi_val < 70:
+    if ma_short > ma_long:
         trend = "BUY"
-    elif current < ema1 and current < ema5 and rsi_val > 30:
+    elif ma_short < ma_long:
         trend = "SELL"
     else:
         trend = "WAIT"
 
-    # Anti-flip (lock previous signal)
-    last = CACHE["last_trend"].get(symbol)
-    if last and last != trend and trend != "WAIT":
-        trend = "WAIT"
+    confidence = int(abs(ma_short - ma_long) / current * 10000)
+    confidence = min(confidence, 95)
 
-    CACHE["last_trend"][symbol] = trend
-
-    confidence = 80 if trend != "WAIT" else 40
-    return trend, confidence
-
-
-# =========================
-# TP / SL
-# =========================
-def tp_sl(entry, trend):
-    if trend == "BUY":
-        return entry * 1.02, entry * 0.99
-    elif trend == "SELL":
-        return entry * 0.98, entry * 1.01
-    return entry, entry
+    return {
+        "symbol": symbol,
+        "trend": trend,
+        "entry": round(current, 5),
+        "tp": round(current * 1.01, 5),
+        "sl": round(current * 0.99, 5),
+        "confidence": confidence,
+        "timestamp": int(time.time())
+    }
 
 
-# =========================
-# GENERATE SIGNALS
-# =========================
+# ================= SIGNAL GENERATOR =================
+
 def generate_signals():
-    signals = []
+    global signals_cache, last_update
 
-    # ===== FOREX =====
-    for pair in FOREX_PAIRS:
-        prices_1m = fetch_twelve(pair, "1min")
-        prices_5m = fetch_twelve(pair, "5min")
+    new_signals = []
 
-        if not prices_1m or not prices_5m:
-            prices_1m = [1 + i * 0.001 for i in range(20)]
-            prices_5m = prices_1m
+    try:
+        # ===== FOREX =====
+        forex_pairs = ["EUR/USD", "GBP/USD"]
 
-        trend, confidence = analyze(prices_1m, prices_5m, pair)
-        entry = prices_1m[-1]
-        tp, sl = tp_sl(entry, trend)
+        for pair in forex_pairs:
+            prices = fetch_forex(pair)
+            signal = calculate_signal(prices, pair)
+            new_signals.append(signal)
+            time.sleep(1)  # prevent rate limit
 
-        signals.append({
-            "symbol": pair,
-            "trend": trend,
-            "entry": round(entry, 5),
-            "tp": round(tp, 5),
-            "sl": round(sl, 5),
-            "confidence": confidence
-        })
+        # ===== CRYPTO =====
+        crypto_map = {
+            "bitcoin": "BITCOIN",
+            "ethereum": "ETHEREUM",
+            "ripple": "RIPPLE"
+        }
 
-    # ===== CRYPTO =====
-    cg = fetch_coingecko()
-    cc = None if cg else fetch_cryptocompare()
+        for coin_id, name in crypto_map.items():
+            prices = fetch_crypto(coin_id)
+            signal = calculate_signal(prices, name)
+            new_signals.append(signal)
+            time.sleep(1)
 
-    for coin in CRYPTO_IDS:
-        price = None
+        signals_cache = new_signals
+        last_update = time.time()
+        bot_status["last_update"] = int(last_update)
+        bot_status["last_error"] = None
 
-        if cg:
-            price = cg.get(coin, {}).get("usd")
-
-        if not price and cc:
-            symbol = coin[:3].upper()
-            price = cc.get(symbol, {}).get("USD")
-
-        if not price:
-            price = synthetic_price()
-
-        tp, sl = tp_sl(price, "BUY")
-
-        signals.append({
-            "symbol": coin.upper(),
-            "trend": "BUY",
-            "entry": round(price, 2),
-            "tp": round(tp, 2),
-            "sl": round(sl, 2),
-            "confidence": 60
-        })
-
-    return signals
+    except Exception as e:
+        bot_status["last_error"] = str(e)
 
 
-# =========================
-# UPDATE
-# =========================
-def update_if_needed():
-    now = time.time()
-    if now - CACHE["last_update"] > CACHE_TTL:
-        CACHE["signals"] = generate_signals()
-        CACHE["last_update"] = now
+# ================= BACKGROUND LOOP =================
+
+def run_bot():
+    while True:
+        try:
+            if time.time() - last_update > REFRESH_INTERVAL:
+                generate_signals()
+        except Exception as e:
+            bot_status["last_error"] = str(e)
+
+        time.sleep(5)
 
 
-# =========================
-# ROUTES
-# =========================
+# ================= ROUTES =================
+
 @app.route("/")
 def home():
-    return jsonify({"status": "running"})
+    return jsonify({"message": "🚀 AI Trading Bot Running"})
 
 
 @app.route("/signals")
-def signals():
-    update_if_needed()
-    return jsonify(CACHE["signals"])
+def get_signals():
+    # Prevent stale data
+    if time.time() - last_update > 120:
+        return jsonify({
+            "status": "stale",
+            "message": "⚠️ Signals outdated, waiting for refresh..."
+        })
+
+    return jsonify(signals_cache)
 
 
 @app.route("/status")
 def status():
     return jsonify({
-        "signals": len(CACHE["signals"]),
-        "last_update": CACHE["last_update"]
+        "running": bot_status["running"],
+        "last_update": bot_status["last_update"],
+        "last_error": bot_status["last_error"],
+        "signals_count": len(signals_cache)
     })
 
 
+# ================= START BOT =================
+
+threading.Thread(target=run_bot, daemon=True).start()
+
+# ================= RUN =================
+
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=10000)
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
